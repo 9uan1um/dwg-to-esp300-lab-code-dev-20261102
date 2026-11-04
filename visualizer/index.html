@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DWG to ESP300 Path Planner</title>
+    <link rel="stylesheet" href="styles.css?v=point-test-20261103" />
+  </head>
+  <body>
+    <header class="global-nav">
+      <div class="global-nav-inner">
+        <div class="brand-mark">DWG to ESP300</div>
+        <nav aria-label="Workspace">
+          <span>Planner</span>
+          <span>Visualizer</span>
+          <span>Export</span>
+        </nav>
+      </div>
+    </header>
+    <div class="sub-nav">
+      <div>
+        <strong>Laser stage planner</strong>
+        <span>25 mm circular sample area</span>
+      </div>
+      <span class="sub-nav-state">ESP300 ready path</span>
+    </div>
+    <main class="shell">
+      <section class="workspace">
+        <header class="toolbar">
+          <div class="source-controls">
+            <div class="source-row">
+              <span class="source-label">File</span>
+              <input id="fileInput" type="file" accept=".dwg,.dxf" />
+              <button id="traceFileButton" class="primary-action" type="button">Open file</button>
+              <button id="clearFileButton" class="secondary-action" type="button">Clear</button>
+            </div>
+            <div class="source-row">
+              <span class="source-label">Path</span>
+              <input id="sourcePath" type="text" value="" placeholder="C:\path\to\drawing.dwg or drawing.dxf" />
+              <button id="tracePathButton" class="primary-action" type="button">Open path</button>
+              <button id="sampleButton" class="secondary-action" type="button">Sample</button>
+            </div>
+          </div>
+          <div class="settings">
+            <label>Trace <select id="traceMode"><option value="design">Cut lines only</option><option value="all">All entities</option></select></label>
+            <span class="fixed-setting">Unit mm</span>
+            <label>Fit longest (mm) <input id="fitLongest" type="number" step="0.001" value="25" /></label>
+            <label>Scale &times; <input id="scaleFactor" type="number" step="0.01" min="0.01" value="1" /></label>
+            <button id="applyScaleButton" class="secondary-action" type="button">Apply scale</button>
+            <label>Rotate (deg) <input id="rotationDeg" type="number" step="1" value="45" /></label>
+            <span class="fixed-setting">Manual circle 2 mm</span>
+            <label>Cut speed (mm/s) <input id="feedRate" type="number" step="0.1" value="0.4" /></label>
+            <label>Travel speed (mm/s) <input id="travelRate" type="number" step="0.1" value="1.0" /></label>
+            <label>Z speed (mm/s) <input id="zSpeed" type="number" step="0.1" value="0.3" /></label>
+            <label class="check"><input id="optimizeToggle" type="checkbox" checked /><span>Optimize path</span></label>
+            <button id="exportButton" class="primary-action" type="button">Download code</button>
+          </div>
+        </header>
+
+        <div class="view-grid">
+          <div class="canvas-wrap">
+            <canvas id="previewCanvas"></canvas>
+            <div class="status" id="statusText">Ready</div>
+          </div>
+          <section class="device-view" aria-label="ESP300 3D sample stage motion">
+            <div id="stage3d"></div>
+            <div class="device-hud">
+              <span id="laserState">Laser OFF</span>
+              <span id="zLabel">Glass Z 0.000 mm</span>
+              <span id="segmentLabel">Idle</span>
+            </div>
+          </section>
+        </div>
+
+        <footer class="timeline">
+          <button id="restartButton" type="button">R</button>
+          <button id="playButton" type="button">&gt;</button>
+          <input id="scrubber" type="range" min="0" max="1000" value="0" />
+          <span id="timeLabel">0.0 s</span>
+          <span id="coordLabel">Glass X 0.000 / Y 0.000 / Z 0.000</span>
+        </footer>
+      </section>
+
+      <aside class="panel">
+        <div class="metrics">
+          <div><span>Size</span><strong id="bboxMetric">-</strong></div>
+          <div><span>Paths</span><strong id="pathMetric">-</strong></div>
+          <div><span>Cut distance</span><strong id="cutMetric">-</strong></div>
+          <div><span>Travel distance</span><strong id="travelMetric">-</strong></div>
+        </div>
+
+        <section class="camera-panel camera-panel-pinned">
+          <div class="panel-title">Focus camera (UVC)</div>
+          <div class="camera-connect">
+            <label>Index <input id="cameraIndex" type="number" min="0" step="1" value="2" /></label>
+            <button id="cameraConnectButton" class="primary-action" type="button">Connect</button>
+            <button id="cameraDisconnectButton" class="secondary-action" type="button">Disconnect</button>
+          </div>
+          <div class="camera-status" id="cameraStatusText">Disconnected</div>
+          <div class="camera-view">
+            <img id="cameraStream" alt="Camera feed" style="cursor: crosshair" title="Click the correct blob to lock the target" />
+            <canvas id="cameraGrid" class="camera-grid" aria-hidden="true" hidden></canvas>
+            <div class="camera-placeholder" id="cameraPlaceholder">No feed</div>
+            <div class="camera-controls">
+              <button id="cameraGridToggle" class="camera-grid-toggle" type="button" aria-label="격자 표시" aria-pressed="true" title="격자 끄기">Grid ON</button>
+            </div>
+          </div>
+          <div class="camera-brightness" id="cameraBrightnessText">Brightness: -</div>
+          <div class="camera-brightness" id="cameraSpotText">Spot: -</div>
+        </section>
+
+        <section class="focus-panel">
+          <div class="panel-title">Camera autofocus (XYZ)</div>
+          <label class="check"><input id="focusSearchXY" type="checkbox" checked /><span>Scan focus: XY에서 시료 신호 찾기 + Z 초점</span></label>
+          <div class="focus-custom">
+            <label>XY 범위 (각 축 ±mm)<input id="focusSearchRange" type="number" min="0.001" step="0.1" placeholder="탐색 범위 입력" /></label>
+            <label>XY 간격 (mm)<input id="focusSearchStep" type="number" min="0.001" step="0.01" value="0.25" /></label>
+            <label>Z 범위 (±mm)<input id="focusSearchZRange" type="number" min="0.001" step="0.01" value="0.1" /></label>
+            <label>Z 간격 (mm)<input id="focusSearchZStep" type="number" min="0.001" step="0.001" value="0.02" /></label>
+          </div>
+          <div class="camera-brightness">현재 위치 기준으로 탐색합니다. 카메라에 발광이 보여야 판정할 수 있습니다. 실패·중지 시 마지막 위치에 머뭅니다. Wide / Narrow는 Z만 탐색합니다.</div>
+          <div class="focus-actions">
+            <button id="focusScanButton" class="primary-action" type="button">Scan focus</button>
+            <button id="focusScanWideButton" class="secondary-action" type="button">Wide rescan</button>
+            <button id="focusScanNarrowButton" class="secondary-action" type="button">Narrow only</button>
+            <button id="focusSearchStop" class="secondary-action" type="button">Stop XYZ search</button>
+          </div>
+          <label class="check focus-active-toggle"><input id="focusActiveToggle" type="checkbox" /><span>Active (auto-refocus on X/Y move)</span></label>
+          <div class="camera-status" id="focusStatusText">Idle</div>
+          <div class="camera-brightness" id="focusResultText">No scan yet.</div>
+
+          <div class="focus-chart-wrap">
+            <svg class="focus-chart" id="focusChart" viewBox="0 0 480 200" preserveAspectRatio="none"></svg>
+            <div class="focus-chart-hint" id="focusChartHint">Drag on the graph to select a range around a peak.</div>
+          </div>
+          <div class="camera-brightness" id="focusSelectionText">No range selected.</div>
+
+          <details class="focus-details">
+            <summary>Custom scan</summary>
+            <div class="focus-custom">
+              <label>Direction
+                <select id="focusCustomDirection">
+                  <option value="both">Both (+-)</option>
+                  <option value="down">Down only</option>
+                  <option value="up">Up only</option>
+                </select>
+              </label>
+              <label>Range (mm) <input id="focusCustomRange" type="number" step="0.001" min="0.001" value="0.1" /></label>
+              <label>Step (mm) <input id="focusCustomStep" type="number" step="0.001" min="0.001" value="0.005" /></label>
+              <label>Settle (s) <input id="focusCustomSettle" type="number" step="0.01" min="0" value="0.05" /></label>
+              <button id="focusCustomButton" class="primary-action" type="button">Run custom scan</button>
+            </div>
+          </details>
+
+          <details class="focus-details">
+            <summary>Timing check</summary>
+            <button id="focusLatencyButton" class="secondary-action" type="button">Verify timing (slow vs fast)</button>
+            <div class="camera-brightness" id="focusLatencyText">No timing check yet.</div>
+          </details>
+
+          <details class="focus-details">
+            <summary>Spiral survey</summary>
+            <label class="check focus-active-toggle"><input id="focusSurveyNarrowToggle" type="checkbox" /><span>Narrow only (skip wide, even on point 1)</span></label>
+            <div class="focus-actions">
+              <button id="focusSurveyButton" class="primary-action" type="button">Survey spiral path</button>
+              <button id="focusSurveyStopButton" class="secondary-action" type="button">Stop survey</button>
+            </div>
+            <div class="camera-status" id="focusSurveyStatusText">No survey yet.</div>
+            <div class="focus-chart-wrap">
+              <svg class="focus-chart" id="focusSurveyMap" viewBox="0 0 480 260" preserveAspectRatio="none"></svg>
+              <div class="focus-chart-hint" id="focusSurveyMapHint">X/Y map fills in live as the survey runs.</div>
+            </div>
+            <div class="camera-brightness" id="focusSurveyMapTip">Hover a point for detail.</div>
+          </details>
+        </section>
+
+        <div class="panel-tabs" role="tablist">
+          <button class="panel-tab active" type="button" data-tab="jog">Jog</button>
+          <button class="panel-tab" type="button" data-tab="shapes">Shapes</button>
+          <button class="panel-tab" type="button" data-tab="paths">Paths</button>
+        </div>
+
+        <div class="panel-tab-body">
+          <div class="tab-pane" data-tab-pane="jog">
+            <section class="jog-panel">
+              <div class="panel-title">Manual jog (ESP300)</div>
+              <div class="jog-connect">
+                <label>Port / bridge address <input id="jogPort" type="text" value="" placeholder="COM port or rfc2217://127.0.0.1:22170" /></label>
+                <label>Windows COM ports <select id="jogWindowsPorts"><option value="">Select a detected port</option></select></label>
+                <label>Baud <input id="jogBaud" type="number" step="1" value="19200" /></label>
+                <label>X/Y range (mm) <input id="jogRangeXY" type="number" step="1" value="75" /></label>
+                <label>Z range (mm) <input id="jogRangeZ" type="number" step="1" value="20" /></label>
+                <label class="check"><input id="jogDryRun" type="checkbox" checked /><span>Dry run (no hardware)</span></label>
+              </div>
+              <div class="jog-connect-actions">
+                <button id="jogWindowsButton" class="secondary-action" type="button">Find Windows ports</button>
+                <button id="jogWslButton" class="secondary-action" type="button">Use WSL (optional)</button>
+                <button id="jogProbeButton" class="secondary-action" type="button" title="Reads the real controller version. Reuses an idle live connection; stop any job first. No motor or motion commands.">Test hardware link (no motion)</button>
+                <button id="jogConnectButton" class="primary-action" type="button">Connect</button>
+                <button id="jogDisconnectButton" class="secondary-action" type="button">Disconnect</button>
+              </div>
+              <div class="jog-status" id="jogStatusText">Disconnected</div>
+              <div class="jog-status" id="jogAxisMap">Axis mapping: checking…</div>
+              <div class="jog-status" id="jogLinkResult" role="status" aria-live="polite">Windows COM works without WSL. Select a port and test the hardware link first. Live Connect enables the axis motors.</div>
+
+              <div class="jog-step">
+                <span>Step (mm)</span>
+                <div class="jog-step-options" id="jogStepOptions">
+                  <button type="button" data-step="0.001">0.001</button>
+                  <button type="button" data-step="0.005">0.005</button>
+                  <button type="button" data-step="0.01">0.01</button>
+                  <button type="button" data-step="0.05">0.05</button>
+                  <button type="button" data-step="0.1" class="active">0.1</button>
+                  <button type="button" data-step="0.5">0.5</button>
+                  <button type="button" data-step="1">1</button>
+                  <button type="button" data-step="5">5</button>
+                </div>
+              </div>
+
+              <div class="jog-pad">
+                <span></span>
+                <button id="jogYPlus" class="jog-key" type="button" data-axis="y" data-dir="1">Y+</button>
+                <span></span>
+                <button id="jogXMinus" class="jog-key" type="button" data-axis="x" data-dir="-1">X-</button>
+                <button id="jogEstop" class="jog-estop" type="button">STOP</button>
+                <button id="jogXPlus" class="jog-key" type="button" data-axis="x" data-dir="1">X+</button>
+                <span></span>
+                <button id="jogYMinus" class="jog-key" type="button" data-axis="y" data-dir="-1">Y-</button>
+                <span></span>
+              </div>
+              <div class="jog-blocked-text" id="jogBlockedText"></div>
+              <div class="jog-z">
+                <button id="jogZPlus" class="jog-key" type="button" data-axis="z" data-dir="1">Z focus +</button>
+                <button id="jogZMinus" class="jog-key" type="button" data-axis="z" data-dir="-1">Z focus -</button>
+              </div>
+              <div class="jog-run-actions jog-home-actions">
+                <button id="jogHomeButton" class="secondary-action" type="button">Home (0, 0, 0)</button>
+                <button id="jogSensorHomeButton" class="secondary-action" type="button" title="Find the central origin sensors on X, Y, then Z">Center (sensors)</button>
+                <button id="jogSetLocalHomeButton" class="secondary-action" type="button">Set local home (도면 중심·초점 등록)</button>
+                <button id="jogGoLocalHomeButton" class="secondary-action" type="button">Go to local home</button>
+              </div>
+              <div class="jog-hint" id="jogSensorHomeStatus" role="status" aria-live="polite">Center uses the machine sensors; Home moves to local (0, 0, 0).</div>
+
+              <div class="jog-goto">
+                <span>Go to (mm)</span>
+                <div class="jog-goto-fields">
+                  <input id="jogGotoX" type="number" step="0.001" placeholder="X" />
+                  <input id="jogGotoY" type="number" step="0.001" placeholder="Y" />
+                  <input id="jogGotoZ" type="number" step="0.001" placeholder="Z" />
+                  <button id="jogGotoButton" class="primary-action" type="button">Go</button>
+                </div>
+              </div>
+              <div class="jog-position" id="jogPositionText">X 12.500 / Y 12.500 / Z 0.000</div>
+              <div class="jog-hint" id="jogMachinePosition"></div>
+              <div class="jog-hint" id="jogManualStatus" role="status" aria-live="polite"></div>
+              <div class="jog-position jog-limit-text" id="jogLimitText"></div>
+              <div class="jog-hint">Hold a button to jog continuously. Arrow keys move X/Y, Page Up/Down move Z, Space is E-STOP.</div>
+
+              <div class="jog-run">
+                <div class="panel-title">Run planned path on machine</div>
+                <label class="test-selection" for="testSelect">
+                  <span>Select Test</span>
+                  <select id="testSelect">
+                    <option value="substrate">Substrate Test</option>
+                    <option value="point" selected>Point Test (Z only)</option>
+                  </select>
+                </label>
+                <div id="pointTestSettings" class="point-test-settings" hidden>
+                  <label>Depth (mm)<input id="pointDepth" type="number" min="0.001" step="0.001" value="3" /></label>
+                  <label>Ingress (mm/s)<input id="pointIngressSpeed" type="number" min="0.01" max="10" step="0.01" value="0.01" /></label>
+                  <span class="jog-hint">Z+ 진입 · 복귀 1 mm/s 고정 · 실행 시작 Z로 복귀</span>
+                </div>
+                <div class="jog-run-actions">
+                  <button id="jogRunButton" class="primary-action" type="button">Run on machine</button>
+<button id="substrateSetUpperRightButton" type="button">Set upper-right</button>
+<button id="substrateGoUpperRightButton" type="button">Go to upper-right</button>
+<button id="substrateTestButton" type="button">Run test</button>
+
+                  <button id="jogRunStopButton" class="secondary-action" type="button">Stop run</button>
+                  <button id="jogRunResumeButton" class="secondary-action" type="button" disabled>Resume from failure</button>
+                </div>
+                <div class="jog-status" id="substrateStatusText" role="status"></div>
+                <div class="jog-hint" id="substrateReferenceText" role="status">Substrate: Set upper-right로 우측 상단·초점 기준을 등록하세요. 경로는 왼쪽·아래쪽 9.6 × 9.6 mm입니다.</div>
+                <label class="check"><input id="jogRunRecordDiagnostics" type="checkbox" /> 상세 구간 기록 (진단용)</label>
+                <div class="jog-status" id="jogRunStatusText">Idle</div>
+                <div class="jog-hint" id="jogRunElapsedText"></div>
+                <div class="jog-hint" id="jogRunBlockedReason" role="status" aria-live="polite" hidden></div>
+              </div>
+            </section>
+          </div>
+
+          <div class="tab-pane hidden" data-tab-pane="shapes">
+            <section class="shape-builder">
+              <div class="panel-title">Manual shapes</div>
+              <div class="shape-tabs">
+                <button class="shape-tab active" type="button" data-shape="line">Line</button>
+                <button class="shape-tab" type="button" data-shape="rect">Rect</button>
+                <button class="shape-tab" type="button" data-shape="circle">Circle</button>
+                <button class="shape-tab" type="button" data-shape="spiral">Spiral</button>
+              </div>
+
+              <div class="shape-fields" data-fields="line">
+                <label>X1 <input id="lineX1" type="number" step="0.001" value="0" /></label>
+                <label>Y1 <input id="lineY1" type="number" step="0.001" value="0" /></label>
+                <label>X2 <input id="lineX2" type="number" step="0.001" value="10" /></label>
+                <label>Y2 <input id="lineY2" type="number" step="0.001" value="0" /></label>
+              </div>
+
+              <div class="shape-fields hidden" data-fields="rect">
+                <label>X <input id="rectX" type="number" step="0.001" value="0" /></label>
+                <label>Y <input id="rectY" type="number" step="0.001" value="0" /></label>
+                <label>W <input id="rectW" type="number" step="0.001" value="10" /></label>
+                <label>H <input id="rectH" type="number" step="0.001" value="5" /></label>
+              </div>
+
+              <div class="shape-fields hidden" data-fields="circle">
+                <label>CX <input id="circleX" type="number" step="0.001" value="5" /></label>
+                <label>CY <input id="circleY" type="number" step="0.001" value="5" /></label>
+                <label>Diameter <input id="circleDiameter" type="number" step="0.001" min="0.001" value="2" /></label>
+              </div>
+
+              <div class="shape-fields hidden" data-fields="spiral">
+                <label>CX <input id="spiralX" type="number" step="0.001" value="12.5" /></label>
+                <label>CY <input id="spiralY" type="number" step="0.001" value="12.5" /></label>
+                <label>Max radius <input id="spiralRadius" type="number" step="0.001" min="0.001" value="11.5" /></label>
+                <label>Turns <input id="spiralTurns" type="number" step="0.5" min="0.5" value="8" /></label>
+              </div>
+
+              <div class="shape-actions">
+                <button id="newManualButton" type="button">Blank</button>
+                <button id="addShapeButton" type="button">Add shape</button>
+                <button id="deleteSelectedButton" type="button">Delete selected</button>
+              </div>
+            </section>
+          </div>
+
+          <div class="tab-pane hidden" data-tab-pane="paths">
+            <div class="path-tools">
+              <button id="selectAllButton" type="button">All</button>
+              <button id="selectNoneButton" type="button">None</button>
+              <input id="globalPasses" type="number" min="1" step="1" value="1" />
+              <button id="applyPassesButton" type="button">Apply</button>
+            </div>
+
+            <div class="path-list" id="pathList"></div>
+          </div>
+        </div>
+      </aside>
+    </main>
+
+    <dialog id="runConfirmDialog" class="run-confirm" aria-labelledby="runConfirmTitle" aria-describedby="runConfirmSummary runConfirmHint">
+      <h2 id="runConfirmTitle">실행 확인 / Confirm run</h2>
+      <p id="runConfirmMode" class="run-confirm-mode"></p>
+      <p id="runConfirmSummary"></p>
+      <p id="runConfirmHint">표시 시간은 전체 이동의 예상 소요 시간입니다. 준비·렌더링 대기 시간이 아닙니다. 시작 버튼을 눌러야 실행됩니다.</p>
+      <div class="run-confirm-actions">
+        <button id="runConfirmCancel" type="button" autofocus>취소 / Cancel</button>
+        <button id="runConfirmStart" class="primary-action" type="button">시작 / Start</button>
+      </div>
+    </dialog>
+    <script type="module" src="app.js?v=camera-rotate-20261103"></script>
+  <script src="substrate-dialog.js?v=point-test-20261103"></script></body>
+</html>

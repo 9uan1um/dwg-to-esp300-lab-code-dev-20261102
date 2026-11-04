@@ -1,0 +1,34 @@
+__pycache__/
+*.pyc
+*.log
+# Machine-local runtime and build products (never commit Python binaries).
+/runtime/
+/runtime-old/
+/.runtime-setup-*/
+/.venv/
+/dist/
+/outputs/
+/uploads/
+/generated/
+/focus_photos/
+/*_log*.csv
+/*_data.csv
+/acad.err
+/ErrorReports/
+
+# Local records excluded from this public source repository.
+/.codex/
+/.agents/
+/.env
+/.env.*
+!/.env.example
+/research/
+/references/
+/logs/
+/stage_data/
+/.*-backup-*/
+/COPY_BASELINE*.json
+/*VERIFICATION*.json
+/SOURCE_*.json
+/SOURCE_*.txt
+/tests_stage/ui-sandbox/

@@ -1,0 +1,11 @@
+# Windows x64 / Python 3.12 application runtime, including the focus camera.
+ezdxf==1.4.3
+pyserial==3.5
+numpy==2.2.6
+opencv-python==4.11.0.86
+# Direct DWG conversion fallback when ODA File Converter is not installed.
+aspose-cad==26.7
+# Pin indirect dependencies so first-launch setup matches the portable build.
+fonttools==4.67.0
+pyparsing==3.3.3
+typing_extensions==4.16.0

@@ -1,0 +1,28 @@
+# Original application + Substrate Test
+
+Launch this folder's `dwg-esp300-launch.cmd`. The original launcher is restored: original planner, foreground console, default web port 8768, original port-conflict handling, and direct `visualizer_server.py` entry. Specify `-Port 8773` if appropriate; do not start duplicate controller owners. Nothing has been launched during this repair.
+
+This copy has no bundled runtime. The sole runtime adjustment reuses its sibling October 28 runtime and verifies the requirements marker; it does not install or modify that runtime. Script imports are pinned to THIS copy. Original source and 3D files are untouched.
+
+Substrate Test has its own **Set upper-right** and **Go to upper-right** controls beside Run on machine. Existing Set local home / Go to local home are unchanged.
+
+**Point Test (Z only)** is selected by default in **Select Test**. Set Depth (default **3 mm**) and Ingress (default **0.01 mm/s**), then choose **Run test** to start immediately, without a separate confirmation, Set upper-right or Set local home. At execution the app reads the stationary current XYZ, moves only Z to **start Z + depth**, waits for arrival, and returns only Z to the captured start Z at a fixed **1 mm/s**. No XY travel, dwell, homing or laser commands are included. Depth means stage displacement, not calibrated optical depth in glass. Nominal default travel time is 300 + 3 seconds, excluding acceleration and communication. Existing connection, focus, motion and limit checks apply. Stop run/error stops the operation without an automatic return. If the existing resume checks allow resumption, it retains the original targets and return speed. Dry run uses the same two segments with accelerated simulation. Restart this copy's backend and refresh to load; no physical execution was performed during development.
+
+1. Connect in the intended Live or Dry run mode. Finish focus scanning/autofocus and other motion.
+2. Jog to the substrate's upper-right starting point at the intended focus Z, then select **Set upper-right**. Registration reads stationary measured coordinates; it sends no motion command and does not change local home, offsets or limits.
+3. Set the requested XY travel speed and select **Substrate Test**. The run uses the saved XYZ reference, regardless of whether its displayed coordinates are zero. It advances along local +X/+Y, over a 9.6 x 9.6 mm span, omitting the reference site. Both travel signs were reversed on November 3 following the user's clarification that directions refer to stage travel, rather than camera-image motion. Controller axis mapping remains the existing jog mapping.
+4. **Go to upper-right** returns to the saved reference in three ordered stages: Z to reference Z minus 0.5 mm, XY to the reference at the configured travel speed, then Z to the reference at 1.2 mm/s. Each stage waits for arrival; existing limits apply. This is a stage-coordinate sequence, not a measured clearance guarantee.
+
+Registration is session-only and invalidated on reconnect, Center (including a new search attempt), Set local home, axis mapping or coordinate/limit changes. Register again after any such change. Ordinary Z focus trim preserves the registered physical XYZ: its displayed local Z is recalculated as the focus offset changes, and Go returns to the original registered physical focus. Original drawing alignment remains independent: registering upper-right authorizes substrate paths, not original drawing paths.
+
+48 sites: 7x7 serpentine at 1.6 mm, sequential 24+24 groups; two sites per relative Z=0.0..3.3 mm in each group, increasing by 0.3 mm per pair. Ingress starts at reference Z minus 0.5 at .4 then .1 mm/s; return at 1.2 mm/s. Normal completion waits 3 seconds, returns XY to upper-right while holding reference Z minus .5, then restores reference Z at 1.2 mm/s. Cancel/error stops without automatic return or sensor homing. No automatic laser control. Requested velocities are not measured instantaneous feedback.
+
+Restart this copy's server and refresh the browser to load the changes. No hardware connection or motion was performed during development. Hardware-free verification: `runtime/python.exe run_upper_right_tests.py` (use the sibling October 28 runtime for this copy); UI control verification: `node test_substrate_buttons.cjs`.
+
+Full-session JSONL logging remains under logs/app_audit, including original control events, requested commands, responses, sampled positions and errors. Requested/sampled-average velocity is not true instantaneous feedback. Hard-kill/power failure can leave an incomplete log tail.
+
+Historical standalone/mock launch files and offline-review artifacts are retained to avoid deleting user files, but are not the main entry or replacement application. Earlier documents describing mock-only startup are superseded by this file.
+
+Known original connection issue: WSL preparation recognizes a bridge only when its script's absolute path matches this folder. An existing October 28 bridge can therefore be rejected by a November 2 app despite identical code. This behavior and bridge scripts are preserved; it is NOT fixed by restoring the launcher. Do not run a second bridge or kill its owner blindly. The earlier controller following-error report is also not cleared or resolved by this software repair.
+
+No server, hardware connection, motion, USB change or installer was run for this restoration. A previously running app needs user-controlled restart to load changed backend files. See MINIMAL_REBASE_MANIFEST.json and MINIMAL_SOURCE_DIFF.patch for exact differences and validation.

@@ -27,13 +27,11 @@ import mimetypes
 import os
 import re
 import shutil
-import statistics
 import subprocess
 import threading
 import time
 import uuid
 import webbrowser
-from dataclasses import asdict
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -42,10 +40,9 @@ from urllib.parse import parse_qs, quote, urlparse
 import cv2
 import numpy as np
 import serial
+from z_limit import Z_MAX_FILE, check_z_target, read_z_max, save_z_max
 from esp300_connection import AXIS_MAPPING_CONFIRMED, ESP300_AXES, ESP300_AXIS_SIGNS, open_esp300, probe_version, read_version, list_serial_ports
-
-import focus_autocal
-import focus_search
+from ready_position import ReadyPositionStore, prepare_ready_locked
 
 # MSMF backend spams a C++ warning on every failed grabFrame (e.g. camera
 # unplugged) with no Python-side rate limit -- left running overnight this
@@ -69,6 +66,7 @@ from dwg_to_esp300 import (
     raw_bbox,
     rotate_paths,
     select_design_paths,
+    skip_known_aspose_watermark,
     transform_paths,
     write_preview_svg,
 )
@@ -106,8 +104,6 @@ JOG_DEFAULT_BAUDRATE = 19200
 JOG_MOTOR_SETTLE_S = 0.05
 JOG_TP_RETRIES = 5
 JOG_TP_RETRY_DELAY = 0.08
-JOG_Z_RANGE_MM = 10.0
-JOG_STEP_MAX_MM = 5.0
 JOG_SPEED_MAX_MM_S = 10.0
 JOG_HOME_SPEED_MM_S = 5.0
 JOG_HOME_TIMEOUT_S = 60.0
@@ -142,72 +138,8 @@ class SerialCommError(RuntimeError):
     against a dead port for a whole deadline just delays and mislabels the
     eventual failure as an unrelated timeout."""
 
-# Autofocus: reuses focus_autocal.scan_focus_z, driving Z through JOG.move
-# in-process (no HTTP round trip, unlike the standalone run_*.py scripts
-# this was ported from). First scan of a session sweeps wide to find the
-# surface; every scan after that -- including active-mode re-triggers after
-# an X/Y move -- stays narrow around wherever the stage already sits, since
-# a scan always ends by moving to its own peak.
-# Wide is direction="down" only (0 .. -FOCUS_WIDE_RANGE_MM) -- the focus
-# surface on this rig is always below the starting Z, so a symmetric +-
-# sweep burned half its travel (and half the JOG Z-safety window) going the
-# wrong way and could trip "outside Z safety range" before ever reaching
-# the real surface.
-FOCUS_WIDE_RANGE_MM = 2.0
-FOCUS_WIDE_STEP_MM = 0.01
-FOCUS_NARROW_RANGE_MM = 1.0
-FOCUS_NARROW_STEP_MM = 0.01
-FOCUS_Z_SPEED_MM_S = 0.3
-# Camera timing: a fixed post-move dwell was proving too short/inconsistent
-# (the background capture loop runs on its own ~15fps cadence, and a
-# slow-auto-exposure frame's integration window can straddle a Z move) --
-# see CameraController.wait_for_fresh(). FOCUS_MECH_SETTLE_S is only for
-# physical vibration damping; the camera timing is covered by waiting for a
-# frame timestamped after (move-complete + FOCUS_EXPOSURE_MARGIN_S).
-FOCUS_MECH_SETTLE_S = 0.02
-FOCUS_EXPOSURE_MARGIN_S = 0.05
-FOCUS_FRAME_WAIT_TIMEOUT_S = 1.0
-# A single camera frame's score is noisy -- a pixel flickering across
-# CORE_MIN_GRAY between frames can swing the target blob's area (and
-# whether a core is found at all) frame to frame, which showed up as the
-# final scan graph having spiky/jumpy points. Averaging a few consecutive
-# frames per Z step smooths that out without adding a real settle delay
-# (frames just keep arriving at the camera's own ~15fps while we read them).
-#
-# 2-sample MEAN (the original fix) was not enough: live scan logs show the
-# core-pairing dropping out to a hard score=0.0 on plenty of individual
-# frames (not just a small wobble), and mean-of-2 lets a single 0.0 drag a
-# real reading down by half or wipe it out entirely if both samples happen
-# to land on a dropout. MEDIAN of an odd count of samples instead ignores
-# up to (N-1)/2 dropped-out frames per step as long as the majority still
-# see the spot -- verified against this rig's own captured scan data.
-FOCUS_BRIGHTNESS_SAMPLES = 5
-FOCUS_XY_DEBOUNCE_S = 0.6
-
-# Trend prediction: fit a plane (z = a*x + b*y + c) through recent scan
-# results and use it to pre-position Z *concurrently* with a deliberate
-# goto() reposition (both axes get their PA command in the same locked
-# block, so they physically move at the same time -- see goto()). This
-# does NOT replace the narrow verification scan that still runs after the
-# move settles: the settle dwell in each scan step is real camera-exposure
-# time, not travel time, so prediction can't shrink it away without giving
-# up the camera-confirmed guarantee. What it removes is the "start from
-# wherever Z happened to be" cold start before that scan.
-FOCUS_PLANE_MIN_SAMPLES = 3
-FOCUS_PLANE_MAX_SAMPLES = 10
-FOCUS_PREDICT_MAX_DELTA_MM = 0.1  # cap so a bad/ill-conditioned fit can't fling Z far on one move
-FOCUS_LOG_PATH = ROOT / "focus_scan_log.csv"
-# Separate files, not more columns on FOCUS_LOG_PATH: that CSV's header is
-# only ever written once (on first creation) and every row since has relied
-# on that fixed 9-column shape -- appending wider rows to it would misalign
-# every existing reader (read_focus_log's DictReader included) against the
-# old header. New data gets its own file instead.
-FOCUS_QUALITY_LOG_PATH = ROOT / "focus_scan_quality_log.csv"
 CAMERA_FREEZE_LOG_PATH = ROOT / "camera_freeze_log.csv"
 SERIAL_RETRY_LOG_PATH = ROOT / "serial_retry_log.csv"
-FOCUS_PHOTO_DIR = ROOT / "focus_photos"
-FOCUS_PHOTO_LOG_PATH = ROOT / "focus_photo_log.csv"
-FOCUS_PHOTO_WAIT_TIMEOUT_S = 2.0
 
 
 def _append_csv_row(path: Path, header: list[str], row: list) -> None:
@@ -225,26 +157,6 @@ def _append_csv_row(path: Path, header: list[str], row: list) -> None:
         pass
 
 
-def _scan_quality_metrics(samples: list[tuple[float, float]]) -> dict:
-    """Zero-dropout rate and curve roughness for one scan's (z, score)
-    samples -- the same two numbers that took a one-off analysis script to
-    compute during the 2026-09-09 focus-jaggedness investigation. Computed
-    for every scan going forward instead of by hand after the fact."""
-    values = [v for _, v in samples]
-    n = len(values)
-    if n == 0:
-        return {"n": 0, "zeroCount": 0, "zeroPct": 0.0, "roughness": 0.0}
-    zero_count = sum(1 for v in values if v == 0.0)
-    peak = max(values) or 1.0
-    total_variation = sum(abs(values[i + 1] - values[i]) for i in range(n - 1))
-    return {
-        "n": n,
-        "zeroCount": zero_count,
-        "zeroPct": round(100.0 * zero_count / n, 2),
-        "roughness": round(total_variation / peak, 3),
-    }
-
-
 CONNECTION_LOCK = threading.Lock()
 CONNECTION_PREPARATION = {"active": False, "phase": None, "error": None}
 
@@ -252,13 +164,14 @@ CONNECTION_PREPARATION = {"active": False, "phase": None, "error": None}
 class JogController:
     """Manual jog interface for the ESP300 stage controller over serial.
 
-    Each /api/jog/move call executes one discrete relative move, bounded by
-    the usable glass circle (X/Y) and a fixed safety window (Z). The client
-    issues repeated calls while a jog control is held.
+    Jog and planned Z moves use the absolute machine Z ceiling.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, ready_path=None, z_limit_path=Z_MAX_FILE) -> None:
         self._lock = threading.Lock()
+        self.z_limit_path = z_limit_path
+        self.z_max_mm = read_z_max(z_limit_path)
+        self.ready_position = ReadyPositionStore(ready_path or ROOT / 'config' / 'ready-position.json')
         self.ser: serial.Serial | None = None
         self.dry_run = True
         self.connected = False
@@ -268,16 +181,9 @@ class JogController:
         self.raw_position = {name: ESP300_AXIS_SIGNS[name] * value for name, value in self.position.items()}
         self.local_offset = {"x": 0.0, "y": 0.0, "z": 0.0}
         self.home_ref = dict(self.position)
-        # Raw (machine) Z at the last calibration point (connect/center/set
-        # local home), used to bound live focus-trim jogging. focus_trim_mm
-        # is the cumulative Z nudge applied via jog since that calibration;
-        # it is folded into local_offset["z"] so every already-planned
-        # focus/defocus target picks it up automatically (see move()).
+        # Physical calibration reference for substrate registration and focus trim.
         self.z_home_raw = 0.0
         self.focus_trim_mm = 0.0
-        self.limit_center = (12.5, 12.5)
-        self.limit_radius = 12.5
-        self.z_range = JOG_Z_RANGE_MM
         self._poll_generation = 0
         self._run_thread: threading.Thread | None = None
         self._run_stop = threading.Event()
@@ -315,8 +221,6 @@ class JogController:
             raise RuntimeError("Connection preparation is in progress. Wait before moving.")
         if self._run_state["running"]:
             raise RuntimeError("A planned path is running or stopping. Stop it and wait for confirmed standstill first.")
-        if FOCUS.scanning:
-            raise RuntimeError("A focus scan is in progress. Wait for confirmed completion first.")
 
     def _require_manual_still_locked(self) -> None:
         if self._manual_target_raw is not None:
@@ -369,8 +273,7 @@ class JogController:
                 self._manual_error += f" Stop command failed: {exc}"
 
     def _run_context_locked(self) -> tuple:
-        return (self._poll_generation, tuple(self.local_offset.items()), tuple(self.home_ref.items()),
-                tuple(self.limit_center), self.limit_radius, self.z_range)
+        return (self._poll_generation, tuple(self.local_offset.items()), tuple(self.home_ref.items()))
 
     def _write(self, cmd: str) -> None:
         if self.dry_run or self.ser is None:
@@ -473,13 +376,28 @@ class JogController:
         """True machine coordinate -> local (reported/design) coordinate."""
         return ESP300_AXIS_SIGNS[name] * (raw_value - self.local_offset[name])
 
-    def _refresh_limits(self) -> None:
-        session = next(iter(SESSIONS.values()), None) if SESSIONS else None
-        metadata = session["metadata"] if session else default_glass_metadata()
-        center = metadata.get("usable_center_xy_mm") or [12.5, 12.5]
-        diameter = float(metadata.get("usable_diameter_mm", 25.0))
-        self.limit_center = (float(center[0]), float(center[1]))
-        self.limit_radius = max(diameter / 2.0, 0.1)
+    def set_z_max(self, value):
+        with self._lock:
+            self._require_no_sensor_home_locked()
+            self._require_no_run_locked()
+            self._require_manual_still_locked()
+            self.z_max_mm = save_z_max(self.z_limit_path, value)
+            return self._status_locked()
+
+    def _check_segment_z(self, segment):
+        if "z" in self._segment_axes(segment):
+            raw_z = (segment["readyRaw"]["z"] if segment.get("readyMove")
+                     else self._raw_of("z", float(segment["to3"][2])))
+            check_z_target(raw_z, self.z_max_mm)
+
+    @staticmethod
+    def _segment_axes(segment):
+        if segment.get("readyMove"):
+            return segment["readySelected"]
+        for name in ("z", "x", "y"):
+            if segment.get(name + "Only"):
+                return name
+        return "xy"
 
     def _status_locked(self) -> dict:
         return {
@@ -492,6 +410,10 @@ class JogController:
             "axisMappingConfirmed": AXIS_MAPPING_CONFIRMED,
             "position": dict(self.position),
             "rawPosition": dict(self.raw_position),
+            "run": dict(self._run_state),
+            "localOffset": dict(self.local_offset),
+            "ready": {**self.ready_position.status(),
+                      "run": dict(self._run_state) if self._run_state.get('readyAxes') else None},
             "connectionPreparation": dict(CONNECTION_PREPARATION),
             "focusTrimMm": round(self.focus_trim_mm, 6),
             "sensorHome": {**self._sensor_home_state, "completed": list(self._sensor_home_state["completed"])},
@@ -503,12 +425,7 @@ class JogController:
                              "error": self._manual_error,
                              "stopping": self._manual_stop_deadline is not None},
             "localHome": dict(self.home_ref),
-            "limit": {
-                "centerX": self.limit_center[0],
-                "centerY": self.limit_center[1],
-                "radiusMm": self.limit_radius,
-                "zRangeMm": self.z_range,
-            },
+            "zMaxMm": self.z_max_mm,
         }
 
     def _disconnect_locked(self) -> None:
@@ -574,8 +491,7 @@ class JogController:
         port: str,
         baudrate: int,
         dry_run: bool,
-        range_xy_mm: float | None = None,
-        range_z_mm: float | None = None,
+        *,
         expected_generation: int | None = None,
     ) -> dict:
         with self._lock:
@@ -586,10 +502,6 @@ class JogController:
             self._require_manual_still_locked()
             if self.connected:
                 if self.dry_run == bool(dry_run) and self.port == str(port or "COM5") and self.baudrate == int(baudrate or JOG_DEFAULT_BAUDRATE):
-                    if range_xy_mm:
-                        self.limit_radius = max(.1, float(range_xy_mm))
-                    if range_z_mm:
-                        self.z_range = max(.1, float(range_z_mm))
                     return {**self._status_locked(), "connectionKeptOpen": True}
                 raise RuntimeError("Disconnect the idle session before changing port or connection mode.")
             if not dry_run and not AXIS_MAPPING_CONFIRMED:
@@ -598,12 +510,6 @@ class JogController:
             self.dry_run = bool(dry_run)
             self.port = str(port or "COM5")
             self.baudrate = int(baudrate or JOG_DEFAULT_BAUDRATE)
-            self._refresh_limits()
-            # An explicit range from the client overrides the traced-session
-            # glass circle, for jog operations unrelated to the loaded job.
-            if range_xy_mm:
-                self.limit_radius = max(0.1, float(range_xy_mm))
-            self.z_range = max(0.1, float(range_z_mm)) if range_z_mm else JOG_Z_RANGE_MM
             # Fresh connection: apply axis direction with offset 0 until
             # set_local_home() is explicitly called.
             # Only the explicit central-sensor search may redefine machine home.
@@ -628,11 +534,11 @@ class JogController:
                             self.ser = None
                     raise
             else:
-                self.position = {"x": self.limit_center[0], "y": self.limit_center[1], "z": 0.0}
+                session = next(iter(SESSIONS.values()), None)
+                metadata = session["metadata"] if session else default_glass_metadata()
+                x, y = metadata.get("usable_center_xy_mm") or (12.5, 12.5)
+                self.position = {"x": float(x), "y": float(y), "z": 0.0}
                 self.raw_position = {name: self._raw_of(name, value) for name, value in self.position.items()}
-            # Recenter the soft limit on the current stage position, in case
-            # it does not match the last traced session's glass center.
-            self.limit_center = (self.position["x"], self.position["y"])
             self.home_ref = dict(self.position)
             self.z_home_raw = self.raw_position["z"]
             self.focus_trim_mm = 0.0
@@ -641,7 +547,6 @@ class JogController:
             self._manual_error = None
             self._manual_stop_deadline = None
             self._telemetry_at = time.monotonic()
-            FOCUS.reset_plane()
             self.connected = True
             self._poll_generation += 1
             generation = self._poll_generation
@@ -683,7 +588,9 @@ class JogController:
             if not self.connected:
                 raise RuntimeError("Jog not connected. Connect first.")
             axis = JOG_AXES[axis_name]
-            delta = max(-JOG_STEP_MAX_MM, min(JOG_STEP_MAX_MM, float(delta_mm)))
+            delta = float(delta_mm)
+            if not math.isfinite(delta):
+                raise ValueError("Jog distance must be finite.")
             speed = max(0.01, min(JOG_SPEED_MAX_MM_S, float(speed_mm_s)))
 
             if axis_name == "z":
@@ -699,8 +606,7 @@ class JogController:
                 # time the plan touches Z. This is what lets the user
                 # refocus mid-run without the correction being undone.
                 new_raw = self.raw_position["z"] + delta
-                if abs(new_raw - self.z_home_raw) > self.z_range:
-                    raise RuntimeError("Move blocked: outside Z safety range.")
+                check_z_target(new_raw, self.z_max_mm)
                 if not self.dry_run:
                     self._write(f"{axis}VA{speed:.6f}")
                     time.sleep(0.02)
@@ -711,16 +617,13 @@ class JogController:
                     self._track_manual_target_locked({**(self._manual_target_raw or self.raw_position), "z": new_raw}, speed)
                 self.local_offset["z"] += delta
                 self.focus_trim_mm += delta
-                FOCUS.notify_z_move(new_raw)
                 return self._status_locked()
 
             target = dict(self.position)
             target[axis_name] = self.position[axis_name] + delta
 
-            dx = target["x"] - self.limit_center[0]
-            dy = target["y"] - self.limit_center[1]
-            if math.hypot(dx, dy) > self.limit_radius:
-                raise RuntimeError("Move blocked: outside usable glass circle.")
+            if not math.isfinite(target[axis_name]):
+                raise ValueError("Jog target must be finite.")
 
             if not self.dry_run:
                 self._write(f"{axis}VA{speed:.6f}")
@@ -736,7 +639,6 @@ class JogController:
                 self.position = target
             else:
                 self._track_manual_target_locked({**(self._manual_target_raw or self.raw_position), axis_name: self._raw_of(axis_name, target[axis_name])}, speed)
-            FOCUS.notify_xy_move()
             return self._status_locked()
 
     def estop(self) -> dict:
@@ -787,6 +689,9 @@ class JogController:
         self._require_no_sensor_home_locked()
         self._require_no_run_locked()
         self._require_manual_still_locked()
+        if not all(math.isfinite(v) for v in target.values()):
+            raise ValueError("XYZ target must be finite.")
+        check_z_target(self._raw_of("z", target["z"]), self.z_max_mm)
         if not self.dry_run:
             for axis in JOG_AXES.values():
                 self._write(f"{axis}VA{max(0.01, float(speed)):.6f}")
@@ -796,19 +701,12 @@ class JogController:
                 self._write(f"{axis}PA{raw:.6f}")
             self._track_manual_target_locked({name: self._raw_of(name, value) for name, value in target.items()}, speed)
         else:
-            # Keep raw_position consistent with the local frame in dry-run
-            # too, so a live Z focus trim (which is bounded against
-            # raw_position/z_home_raw) behaves the same whether or not
-            # hardware is attached.
             for name in target:
                 self.raw_position[name] = self._raw_of(name, target[name])
             self.position = dict(target)
-        FOCUS.notify_xy_move()
 
     def home(self) -> dict:
-        """Move X/Y/Z to the local coordinate origin (0,0,0). This move is
-        not subject to the jog soft limits, as the origin is the reference
-        point by definition."""
+        """Move to the local coordinate origin within the machine Z limit."""
         with self._lock:
             self._require_no_sensor_home_locked()
             self._require_no_run_locked()
@@ -830,7 +728,7 @@ class JogController:
             if not already_home:
                 self._send_absolute_locked(target, JOG_HOME_SPEED_MM_S)
             # Home is only a move to local zero. It must not overwrite the
-            # labeled return point, limits, focus trim or coordinate frame.
+            # labeled return point, focus trim or coordinate frame.
             if already_home:
                 self._manual_error = None
             return {**self._status_locked(), "alreadyHome": already_home,
@@ -844,7 +742,7 @@ class JogController:
         without motion or any serial command. This adjusts only the
         software-side coordinate offset; the ESP300's absolute machine
         coordinate system is not modified. Passing the loaded design's
-        center aligns reported/limit/Run-on-machine coordinates with the
+        center aligns reported and Run-on-machine coordinates with the
         design frame."""
         with self._lock:
             self._require_no_sensor_home_locked()
@@ -856,12 +754,10 @@ class JogController:
             self._substrate_upper_right = None
             self.local_offset = {name: self.raw_position[name] - ESP300_AXIS_SIGNS[name] * ref[name] for name in ref}
             self.position = dict(ref)
-            self.limit_center = (ref["x"], ref["y"])
             self.home_ref = dict(ref)
             self.z_home_raw = self.raw_position["z"]
             self.focus_trim_mm = 0.0
             self._alignment_required = False
-            FOCUS.reset_plane()
             return self._status_locked()
 
     def go_to_local_home(self) -> dict:
@@ -891,32 +787,49 @@ class JogController:
             return self._status_locked()
 
     def goto(self, x: float, y: float, z: float) -> dict:
-        """Move to an absolute X/Y/Z (mm), subject to the usable glass
-        circle and Z safety window."""
+        """Move to a local XYZ target after conversion to the machine frame."""
         with self._lock:
             self._require_no_sensor_home_locked()
             if not self.connected:
                 raise RuntimeError("Jog not connected. Connect first.")
             target = {"x": float(x), "y": float(y), "z": float(z)}
-            if FOCUS.active and abs(target["z"] - self.position["z"]) <= 1e-6:
-                # Caller left Z untouched (the UI sends the current position
-                # when that field is blank) -- substitute the trend-predicted
-                # focus height so Z travels concurrently with X/Y in the same
-                # _send_absolute_locked() call, instead of sitting wherever it
-                # was until the post-move narrow scan finds the real peak.
-                predicted = FOCUS.predict_z(target["x"], target["y"])
-                if predicted is not None and abs(predicted - target["z"]) <= FOCUS_PREDICT_MAX_DELTA_MM:
-                    target["z"] = predicted
-            dx = target["x"] - self.limit_center[0]
-            dy = target["y"] - self.limit_center[1]
-            if math.hypot(dx, dy) > self.limit_radius:
-                raise RuntimeError("Move blocked: outside usable glass circle.")
-            if abs(target["z"] - self.home_ref["z"]) > self.z_range:
-                raise RuntimeError("Move blocked: outside Z safety range.")
             self._send_absolute_locked(target, JOG_SPEED_MAX_MM_S)
             return self._status_locked()
 
-    def run_plan(self, segments: list[dict], record_diagnostics: bool = False, *, point_settings: dict | None = None) -> dict:
+    def save_ready_position(self, position) -> dict:
+        with self._lock:
+            self._require_no_sensor_home_locked()
+            self._require_no_run_locked()
+            self._require_manual_still_locked()
+            self.ready_position.save(position, 'manual-entry')
+            return self._status_locked()
+
+    def capture_ready_position(self, mode) -> dict:
+        with self._lock:
+            self._require_no_sensor_home_locked()
+            self._require_no_run_locked()
+            self._require_manual_still_locked()
+            if not self.connected or self.dry_run or mode != 'live':
+                raise RuntimeError('현재 위치 저장은 Live 연결에서만 가능합니다.')
+            measured = self._read_run_pose_locked()
+            self.ready_position.save(measured, 'controller-readback')
+            return self._status_locked()
+
+    def move_to_saved_xy(self, mode) -> dict:
+        return self.run_plan([], record_diagnostics=True, ready_settings={'axes': 'xy', 'mode': mode})
+
+    def move_to_saved_z(self, mode) -> dict:
+        return self.run_plan([], record_diagnostics=True, ready_settings={'axes': 'z', 'mode': mode})
+
+    def move_to_saved_xyz(self, mode) -> dict:
+        return self.run_plan([], record_diagnostics=True, ready_settings={'axes': 'xyz', 'mode': mode})
+
+    def _check_ready_context_locked(self, segment):
+        if (segment['readyContext'] != self._run_context_locked()
+                or segment['readyAxisMap'] != (JOG_AXES, ESP300_AXIS_SIGNS)):
+            raise RuntimeError('Ready coordinate configuration changed; stopping.')
+
+    def run_plan(self, segments: list[dict], record_diagnostics: bool = False, *, point_settings: dict | None = None, line_settings: dict | None = None, circle_settings: dict | None = None, ready_settings: dict | None = None) -> dict:
         if isinstance(segments, dict) or any(isinstance(s, dict) and
                 (s.get("schema") == "offline-depth-recipe-v1" or "target_relative_stage_z_mm" in s)
                 for s in segments):
@@ -925,20 +838,30 @@ class JogController:
         each segment's arrival confirmed before the next is issued. Runs in
         a background thread; poll run_status() for progress."""
         with self._lock:
+            if any(s.get('readyMove') for s in segments):
+                raise ValueError('Ready moves must be prepared by the Ready endpoint.')
+            if sum(s is not None for s in (point_settings, line_settings, circle_settings, ready_settings)) > 1:
+                raise ValueError("Choose one test recipe.")
+            if ready_settings is not None:
+                segments = prepare_ready_locked(self, ready_settings)
+            if circle_settings is not None:
+                from circle_test import prepare_circle_locked
+                segments = prepare_circle_locked(self, circle_settings)
+            if line_settings is not None:
+                if point_settings is not None:
+                    raise ValueError("Choose one test recipe.")
+                from line_test import prepare_line_locked
+                segments = prepare_line_locked(self, line_settings)
             if point_settings is not None:
-                if FOCUS.active or FOCUS.scanning or FOCUS.surveying:
-                    raise RuntimeError("Finish autofocus and focus scans before a point test.")
                 from point_test import prepare_point_locked
                 segments = prepare_point_locked(self, point_settings)
             if CONNECTION_PREPARATION["active"]:
                 raise RuntimeError("Connection preparation is in progress. Wait before running.")
-            if FOCUS.scanning or FOCUS.surveying:
-                raise RuntimeError("Focus scan or survey is in progress. Wait before starting a path.")
             self._require_no_sensor_home_locked()
             self._require_manual_still_locked()
             if self._manual_error:
                 raise RuntimeError(f"Previous manual move failed: {self._manual_error}")
-            if self._alignment_required and point_settings is None:
+            if self._alignment_required and point_settings is None and line_settings is None and circle_settings is None and ready_settings is None:
                 from substrate_production import upper_right
                 if not segments or not all(s.get('substrateTrial') for s in segments) or upper_right(self) is None:
                     raise RuntimeError("Sensor homing changed the machine reference. Align the sample and use Set local home (or Set upper-right for Substrate Test).")
@@ -960,6 +883,7 @@ class JogController:
                     raise ValueError("Segment origin must contain finite XYZ coordinates.")
                 if segment.get("speedMmS") is not None and (not math.isfinite(float(segment["speedMmS"])) or not 0 < float(segment["speedMmS"]) <= JOG_SPEED_MAX_MM_S):
                     raise ValueError(f"Segment speed must be within 0~{JOG_SPEED_MAX_MM_S} mm/s.")
+                self._check_segment_z(segment)
             self._run_segments = saved
             self._run_origins = {}
             self._run_context = self._run_context_locked()
@@ -970,6 +894,8 @@ class JogController:
             self._run_state = {"running": True, "index": 0, "total": len(saved), "error": None, "done": False,
                                "jobId": uuid.uuid4().hex, "phase": "running", "activeSegment": 1,
                                "stopConfirmed": False, "resumable": False, "resumeBlockedReason": None}
+            if ready_settings is not None:
+                self._run_state['readyAxes'] = ready_settings['axes']
             # Explicit diagnostic runs only. No disk I/O or extra serial
             # queries in the execution loop; normal runs retain no trace.
             self._run_recording = record_diagnostics is True
@@ -1028,10 +954,12 @@ class JogController:
             if self._run_pause_raw is None or any(abs(measured[n] - self._run_pause_raw[n]) > 0.02 for n in measured):
                 self._run_state.update(resumable=False, resumeBlockedReason="Stage position changed since the stop. Review the path and start a new job.")
                 raise RuntimeError(self._run_state["resumeBlockedReason"])
+            start = self._run_state["index"]
+            for segment in self._run_segments[start:]:
+                self._check_segment_z(segment)
             self._run_stop.clear()
             self._run_stop_sent = False
             self._run_stop_error = None
-            start = self._run_state["index"]
             self._run_state.update(running=True, phase="running", done=False, error=None, stopConfirmed=False,
                                    resumable=False, resumeBlockedReason=None, activeSegment=start + 1)
             self._record_run_event_locked("run_resume", firstSegment=start + 1, localPosition=dict(self.position))
@@ -1103,13 +1031,6 @@ class JogController:
             self._sensor_home_state = {"running": True, "axis": None, "completed": [], "done": False, "error": None}
             self._sensor_home_stop.clear()
             generation = self._poll_generation
-        # Do not hold the jog lock while acquiring the focus lock. Focus scan
-        # admission checks sensorHome.running, closing the reservation race.
-        focus = FOCUS.status()
-        if focus["active"] or focus["scanning"] or focus["surveying"]:
-            with self._lock:
-                self._sensor_home_state.update(running=False, error="Disable autofocus and finish any focus scan/survey before central sensor homing.")
-            raise RuntimeError(self._sensor_home_state["error"])
         thread = threading.Thread(target=self._sensor_home_worker, args=(generation,), daemon=True)
         self._sensor_home_thread = thread
         thread.start()
@@ -1186,10 +1107,6 @@ class JogController:
 
             # Invalidate sample alignment as soon as a search may change machine
             # coordinates, including partially completed/aborted sequences.
-            FOCUS.reset_plane()
-            with FOCUS._lock:
-                FOCUS.has_baseline = False
-                FOCUS.last_result = None
             for name, (_, mode) in SENSOR_HOME_AXES.items():
                 axis = JOG_AXES[name]
                 with self._lock:
@@ -1254,7 +1171,6 @@ class JogController:
                 self.local_offset = {name: self.raw_position[name] - ESP300_AXIS_SIGNS[name] * value
                                      for name, value in self.position.items()}
                 self.home_ref = dict(self.position)
-                self.limit_center = (cx, cy)
                 self.z_home_raw = self.raw_position["z"]
                 self.focus_trim_mm = 0.0
         except Exception as exc:
@@ -1315,6 +1231,7 @@ class JogController:
             tolerance = 0.02
             for index in range(start_index, len(segments)):
                 segment = segments[index]
+                tolerance = .001 if segment.get('readyMove') else .02
                 current_segment = index + 1
                 duration = max(float(segment.get("duration", 0.1)), 0.05)
                 target = dict(zip(("x", "y", "z"), map(float, segment["to3"])))
@@ -1344,9 +1261,17 @@ class JogController:
                         raise RunStopRequested()
                     if self._poll_generation != generation or not self.connected:
                         raise RuntimeError("Stage connection changed during the job.")
+                    if segment.get('readyMove'):
+                        self._check_ready_context_locked(segment)
                     if segment.get("pointTest"):
                         if segment.get("pointContext") != self._run_context_locked() or segment.get("pointAxes") != (JOG_AXES, ESP300_AXIS_SIGNS):
                             raise RuntimeError("Point test coordinate configuration changed; stopping")
+                    if segment.get("lineTest"):
+                        if segment.get("lineContext") != self._run_context_locked() or segment.get("lineAxes") != (JOG_AXES, ESP300_AXIS_SIGNS):
+                            raise RuntimeError("Line test coordinate configuration changed; stopping")
+                    if segment.get("circleTest"):
+                        if segment.get("circleContext") != self._run_context_locked() or segment.get("circleAxes") != (JOG_AXES, ESP300_AXIS_SIGNS):
+                            raise RuntimeError("Circle test coordinate configuration changed; stopping")
                     if segment.get("substrateTrial"):
                         if segment.get("substrateContext") != self._run_context_locked() or segment.get("substrateAxes") != (JOG_AXES, ESP300_AXIS_SIGNS):
                             raise RuntimeError("Substrate origin/configuration changed; stopping")
@@ -1362,7 +1287,8 @@ class JogController:
                         targetRaw={name: self._raw_of(name, value) for name, value in target.items()},
                         plannedDurationS=duration, dryRun=self.dry_run,
                     )
-                    names = ("z",) if segment.get("zOnly") else ("x", "y")
+                    names = self._segment_axes(segment)
+                    self._check_segment_z(segment)
                     planned_distance = math.sqrt(sum((target[n] - origin[n]) ** 2 for n in names))
                     remaining_distance = math.sqrt(sum((target[n] - cur[n]) ** 2 for n in names))
                     path_speed = float(segment.get("speedMmS", planned_distance / duration))
@@ -1370,6 +1296,8 @@ class JogController:
                         raise RuntimeError("An initial positioning segment needs an explicit positive travel speed.")
                     effective_duration = remaining_distance / path_speed if path_speed > 0 else duration
                     for name in names:
+                        if segment.get('readyMove'):
+                            self._check_ready_context_locked(segment)
                         if abs(target[name] - cur[name]) <= 1e-6:
                             continue
                         axis = JOG_AXES[name]
@@ -1384,7 +1312,7 @@ class JogController:
                         time.sleep(0.02)
                         if self._run_stop.is_set():
                             raise RunStopRequested()
-                        raw = self._raw_of(name, target[name])
+                        raw = segment["readyRaw"][name] if segment.get("readyMove") else self._raw_of(name, target[name])
                         self._write(f"{axis}PA{raw:.6f}")
                         axes_to_move.append((name, axis, raw))
                     # Never assign targets to measured position in live mode.
@@ -1396,15 +1324,24 @@ class JogController:
                             raise RunStopRequested()
                         for name in names:
                             self.position[name] = target[name]
-                            self.raw_position[name] = self._raw_of(name, target[name])
+                            self.raw_position[name] = segment["readyRaw"][name] if segment.get("readyMove") else self._raw_of(name, target[name])
                 else:
                     deadline = time.monotonic() + max(3.0, effective_duration * 4 + 2.0)
                     while True:
                         if self._run_stop.is_set():
                             raise RunStopRequested()
+                        if segment.get('readyMove'):
+                            with self._lock:
+                                self._check_ready_context_locked(segment)
                         if segment.get("pointTest"):
                             if segment.get("pointContext") != self._run_context_locked() or segment.get("pointAxes") != (JOG_AXES, ESP300_AXIS_SIGNS):
                                 raise RuntimeError("Point test coordinate configuration changed while moving")
+                        if segment.get("lineTest"):
+                            if segment.get("lineContext") != self._run_context_locked() or segment.get("lineAxes") != (JOG_AXES, ESP300_AXIS_SIGNS):
+                                raise RuntimeError("Line test coordinate configuration changed while moving")
+                        if segment.get("circleTest"):
+                            if segment.get("circleContext") != self._run_context_locked() or segment.get("circleAxes") != (JOG_AXES, ESP300_AXIS_SIGNS):
+                                raise RuntimeError("Circle test coordinate configuration changed while moving")
                         if segment.get("substrateTrial"):
                             app_audit.RECORDER.checkpoint()
                             if segment.get("substrateContext") != self._run_context_locked() or segment.get("substrateAxes") != (JOG_AXES, ESP300_AXIS_SIGNS):
@@ -1455,6 +1392,11 @@ class JogController:
                     if self._run_stop.is_set():
                         raise RunStopRequested()
                     # Only verified complete segments advance the resume index.
+                    if segment.get('readyMove'):
+                        self._check_ready_context_locked(segment)
+                        measured = self._read_run_pose_locked()
+                        if any(abs(measured[n] - segment['readyRaw'][n]) > tolerance for n in 'xyz'):
+                            raise RuntimeError('Ready final position differs from the measured target.')
                     self._run_state["index"] = current_segment
                     self._record_run_event_locked(
                         "segment_complete", segment=current_segment, kind=segment.get("kind"),
@@ -2000,859 +1942,6 @@ class CameraController:
 CAMERA = CameraController()
 
 
-class FocusScanner:
-    """Camera-brightness Z autofocus (see focus_autocal.scan_focus_z).
-
-    run() drives one calibration: wide+narrow on the first call (or when
-    forced), narrow-only after that. set_active(True) arms a background
-    watcher that re-runs a narrow scan on its own, debounced, whenever an
-    X/Y reposition (jog/goto/home) fires notify_xy_move() -- see the JOG
-    hooks in JogController.move()/_send_absolute_locked(). Scripted cut
-    runs (run_plan) deliberately do NOT trigger this: nudging Z mid-cut
-    would corrupt the plan's already-baked focus/defocus segments.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.scanning = False
-        self.active = False
-        self.has_baseline = False
-        self.stage: str | None = None
-        self.error: str | None = None
-        self.last_result: dict | None = None
-        self._xy_event = threading.Event()
-        self._stop_event = threading.Event()
-        self._watcher: threading.Thread | None = None
-        self._plane_samples: list[tuple[float, float, float]] = []
-        self._last_verified_raw_z: float | None = None
-        self._z_departed = False
-        self.latency_check: dict | None = None
-        self.surveying = False
-        self.survey: dict | None = None
-        self._survey_stop = threading.Event()
-        self.live_samples: list[tuple[float, float]] = []
-        self._search_cancel = threading.Event()
-
-    def run_search(self, xy_range: float, xy_step: float, z_range: float, z_step: float) -> dict:
-        points, zs = focus_search.search_grid(xy_range, xy_step, z_range, z_step)
-        with JOG._lock, self._lock:
-            self._start_locked()
-            try:
-                origin = {name: JOG._read_axis_position(axis) for name, axis in JOG_AXES.items()}
-                offsets = dict(JOG.local_offset)
-                # Validate the entire box before the first motion command.
-                for x, y in points:
-                    lx = JOG._local_of("x", origin["x"]) + x
-                    ly = JOG._local_of("y", origin["y"]) + y
-                    if math.hypot(lx-JOG.limit_center[0], ly-JOG.limit_center[1]) > JOG.limit_radius:
-                        raise RuntimeError("XYZ search exceeds the usable XY circle. Reduce XY range.")
-                if max(abs(origin["z"] + z - JOG.z_home_raw) for z in zs) > JOG.z_range:
-                    raise RuntimeError("XYZ search exceeds the Z safety range. Reduce Z range.")
-                generation = JOG._poll_generation
-                self._search_cancel.clear()
-                self.has_baseline = False
-                self.last_result = None
-                self._plane_samples.clear()
-                self._last_verified_raw_z = None
-                self.stage = "XYZ acquisition"
-            except Exception:
-                self.scanning = False
-                raise
-        threading.Thread(target=self._search_worker, args=(points, zs, origin, offsets, generation), daemon=True).start()
-        return self.status()
-
-    def stop_search(self) -> dict:
-        self._search_cancel.set()
-        return self.status()
-
-    def _search_move(self, target: dict, generation: int) -> None:
-        # Absolute raw targets; XY offsets are never redefined by acquisition.
-        with JOG._lock:
-            if self._search_cancel.is_set():
-                raise RuntimeError("XYZ search stopped. Stage remains at its current position.")
-            if not JOG.connected or JOG.dry_run or JOG._poll_generation != generation:
-                raise RuntimeError("XYZ search connection changed.")
-            if JOG._run_state["running"] or JOG._sensor_home_state["running"]:
-                raise RuntimeError("XYZ search interrupted by another motion workflow.")
-            if not all(math.isfinite(v) for v in target.values()):
-                raise RuntimeError("Invalid XYZ target.")
-            lx, ly = JOG._local_of("x", target["x"]), JOG._local_of("y", target["y"])
-            if (math.hypot(lx-JOG.limit_center[0], ly-JOG.limit_center[1]) > JOG.limit_radius
-                    or abs(target["z"]-JOG.z_home_raw) > JOG.z_range):
-                raise RuntimeError("XYZ target exceeds motion limits.")
-            start = {name: JOG._read_axis_position(axis) for name, axis in JOG_AXES.items()}
-            try:
-                for name, axis in JOG_AXES.items():
-                    JOG._write(f"{axis}VA{FOCUS_Z_SPEED_MM_S:.6f}")
-                    JOG._write(f"{axis}PA{target[name]:.6f}")
-                JOG._track_manual_target_locked(target, FOCUS_Z_SPEED_MM_S)
-            except Exception:
-                JOG._manual_error = "XYZ command failed. Check controller and position before retrying."
-                try:
-                    JOG._write("ST")
-                except Exception:
-                    pass
-                raise
-        deadline = time.monotonic() + max(5, max(abs(target[n]-start[n]) for n in target)/FOCUS_Z_SPEED_MM_S*2+2)
-        while True:
-            with JOG._lock:
-                if not JOG.connected or JOG._poll_generation != generation:
-                    raise RuntimeError("XYZ search connection changed.")
-                if self._search_cancel.is_set() or time.monotonic() > deadline or JOG._manual_error:
-                    JOG._write("ST")
-                    JOG._manual_error = "XYZ search stopped or motion timed out. Check position before retrying."
-                    raise RuntimeError(JOG._manual_error)
-                done = True
-                for name, axis in JOG_AXES.items():
-                    arrived = JOG._query(f"{axis}MD?").strip() == "1"
-                    raw = JOG._read_axis_position(axis)
-                    JOG.raw_position[name] = raw
-                    JOG.position[name] = JOG._local_of(name, raw)
-                    done = done and arrived and abs(raw-target[name]) <= .001
-                if done:
-                    JOG._manual_target_raw = None
-                    return
-            time.sleep(.02)
-
-    def _search_worker(self, points, zs, origin, offsets, generation) -> None:
-        try:
-            def measure(x, y, z):
-                # XY inputs use drawing-local directions (including the Y sign).
-                with JOG._lock:
-                    target = {n: JOG._raw_of(n, JOG._local_of(n, origin[n]) + d)
-                              for n, d in (("x", x), ("y", y))}
-                target["z"] = origin["z"] + z
-                self._search_move(target, generation)
-                time.sleep(FOCUS_MECH_SETTLE_S)
-                return self._read_brightness(after_time=time.monotonic())
-
-            def progress(index, total, samples):
-                with self._lock:
-                    self.stage = f"XYZ {index}/{total}"
-                    self.live_samples = list(samples)
-
-            result = focus_search.acquire_focus(points, zs, measure, progress)
-            with JOG._lock:
-                if self._search_cancel.is_set() or not JOG.connected or JOG._poll_generation != generation:
-                    raise RuntimeError("XYZ search interrupted before focus commit.")
-                JOG.local_offset["z"] = offsets["z"] + result.z
-                JOG.focus_trim_mm += result.z
-                JOG.position["z"] = JOG._local_of("z", JOG.raw_position["z"])
-            primary = focus_autocal.FocusScanResult(result.z, result.samples, False)
-            self._finish_scan(primary, None, label="XYZ camera acquisition (rechecked)")
-            with self._lock:
-                self.last_result["acquisition"] = {"xOffsetMm": result.x, "yOffsetMm": result.y,
-                                                  "verifiedScore": result.verified_score, "visited": result.visited}
-        except Exception as exc:
-            with JOG._lock:
-                if JOG.connected and JOG._poll_generation == generation and JOG._manual_target_raw is not None:
-                    JOG._manual_error = "XYZ search interrupted during motion. Check position before retrying."
-                    try:
-                        JOG._write("ST")
-                    except Exception:
-                        pass
-            with self._lock:
-                self.error = str(exc)
-        finally:
-            with self._lock:
-                self.scanning = False
-                self.stage = None
-
-    def status(self) -> dict:
-        with self._lock:
-            return {
-                "scanning": self.scanning,
-                "active": self.active,
-                "hasBaseline": self.has_baseline,
-                "stage": self.stage,
-                "error": self.error,
-                "lastResult": self.last_result,
-                "planeSamples": len(self._plane_samples),
-                "latencyCheck": self.latency_check,
-                "surveying": self.surveying,
-                "survey": self.survey,
-                "liveStage": self.stage,
-                "liveSamples": [[z, v] for z, v in self.live_samples] if self.scanning else [],
-                "focusTiming": {
-                    "speedMmS": FOCUS_Z_SPEED_MM_S,
-                    "mechSettleS": FOCUS_MECH_SETTLE_S,
-                    "exposureMarginS": FOCUS_EXPOSURE_MARGIN_S,
-                    "narrowRangeMm": FOCUS_NARROW_RANGE_MM,
-                    "narrowStepMm": FOCUS_NARROW_STEP_MM,
-                },
-            }
-
-    def notify_xy_move(self) -> None:
-        if self.active:
-            self._xy_event.set()
-
-    def notify_z_move(self, raw_z: float) -> None:
-        """Called on every Z jog (the manual focus-trim control) with the
-        new raw/machine Z. Does NOT trigger on every nudge -- that would
-        fight a manual trim in progress. Only the "left the last verified
-        focus band, then came back near it" transition re-arms the
-        debounced narrow scan, same trigger the XY-move hooks use. A scan's
-        own internal Z stepping (via _run_stage's move_to) also goes
-        through JogController.move() and must NOT count as a user
-        excursion, so this is a no-op while a scan is in progress."""
-        if not self.active or self.scanning:
-            return
-        trigger = False
-        with self._lock:
-            if self._last_verified_raw_z is None:
-                return
-            distance = abs(raw_z - self._last_verified_raw_z)
-            if distance > FOCUS_NARROW_RANGE_MM:
-                self._z_departed = True
-                return
-            if self._z_departed:
-                self._z_departed = False
-                trigger = True
-        if trigger:
-            self._xy_event.set()
-
-    def reset_plane(self) -> None:
-        """Drop trend samples and the verified-Z reference. Call whenever
-        the local coordinate frame is redefined (connect / center /
-        set_local_home) -- old (x, y, z) triples and the last verified raw
-        Z are expressed in a frame/session that no longer applies."""
-        with self._lock:
-            self._plane_samples.clear()
-            self._last_verified_raw_z = None
-            self._z_departed = False
-
-    def predict_z(self, x: float, y: float) -> float | None:
-        """Trend-based Z prediction for local (x, y), fit from recent scan
-        results. None until at least one scan has completed this frame."""
-        with self._lock:
-            samples = list(self._plane_samples)
-        if not samples:
-            return None
-        if len(samples) < FOCUS_PLANE_MIN_SAMPLES:
-            return samples[-1][2]  # too few points for a plane -- assume last-known height
-        xs = np.array([s[0] for s in samples])
-        ys = np.array([s[1] for s in samples])
-        zs = np.array([s[2] for s in samples])
-        design = np.column_stack([xs, ys, np.ones_like(xs)])
-        try:
-            (a, b, c), *_ = np.linalg.lstsq(design, zs, rcond=None)
-        except np.linalg.LinAlgError:
-            return samples[-1][2]
-        return float(a * x + b * y + c)
-
-    def _read_brightness(self, after_time: float | None = None, exposure_margin: float = FOCUS_EXPOSURE_MARGIN_S) -> float:
-        """Score for one scan step -- deliberately the same `peak.score`
-        the camera panel draws as the green/yellow blob circles, NOT
-        brightness.mean. mean is a whole-frame grayscale average: a
-        defocused glow spread over more pixels can raise it just as much
-        as (or more than) a small, tight, truly-in-focus spark, so it can
-        pick a different Z than the one where the tracked blob actually
-        looks right. score is locate_bright_regions()'s summed intensity
-        over just the red-glow + overexposed-core masks -- the same signal
-        the blob overlay is drawn from -- so the scan's peak lines up with
-        what the operator sees growing on screen.
-
-        after_time, when given, blocks for a frame timestamped strictly
-        after after_time + FOCUS_EXPOSURE_MARGIN_S instead of trusting
-        whatever CAMERA.status() returns right now -- see
-        CameraController.wait_for_fresh for why a fixed post-move dwell
-        isn't enough (background capture cadence + camera exposure time can
-        both make "the latest frame" one grabbed before the move finished).
-
-        Takes the MEDIAN of FOCUS_BRIGHTNESS_SAMPLES consecutive frames
-        (each waited for fresh in turn, so no two reads are the same frame)
-        instead of trusting one or averaging: single-frame score doesn't
-        just wobble, it can hard-drop to exactly 0.0 whenever that one
-        frame fails to pair a red-glow blob with a nested saturated core
-        (see locate_bright_regions). A mean lets one dropped-out frame drag
-        or wipe the whole step's reading; the median instead needs a
-        majority of the samples to drop out before it's affected."""
-        cursor = after_time
-        scores: list[float] = []
-        for i in range(max(1, FOCUS_BRIGHTNESS_SAMPLES)):
-            if cursor is not None:
-                wait_after = cursor + exposure_margin if i == 0 else cursor
-                status = CAMERA.wait_for_fresh(wait_after, timeout=FOCUS_FRAME_WAIT_TIMEOUT_S)
-                if status.get("frameTime", 0) <= wait_after:
-                    raise RuntimeError("Focus measurement timed out waiting for a fresh camera frame.")
-            else:
-                status = CAMERA.status()
-            if not status.get("connected"):
-                raise RuntimeError("Camera not connected.")
-            peak = status.get("peak")
-            scores.append(float(peak.get("score") or 0.0) if peak else 0.0)
-            cursor = status.get("frameTime", cursor)
-        return statistics.median(scores)
-
-    def _move_confirmed(self, raw_target: float, offset_target: float) -> None:
-        """Focus steps use absolute targets and measured MD/TP arrival.
-
-        A time-based dwell is not arrival, and cached TP can be older than
-        a short focus step. Never accumulate relative moves from that cache.
-        The 1 um tolerance validates controller-reported position only.
-        """
-        axis = JOG_AXES["z"]
-        with JOG._lock:
-            if not JOG.connected or JOG.dry_run or JOG._run_state["running"] or JOG._sensor_home_state["running"]:
-                raise RuntimeError("Live idle controller required for focus motion.")
-            if not math.isfinite(raw_target) or abs(raw_target - JOG.z_home_raw) > JOG.z_range:
-                raise RuntimeError("Focus move blocked: outside Z safety range.")
-            generation = JOG._poll_generation
-            start = JOG._read_axis_position(axis)
-            JOG.raw_position["z"] = start
-            delta_offset = offset_target - JOG.local_offset["z"]
-            JOG._write(f"{axis}VA{FOCUS_Z_SPEED_MM_S:.6f}")
-            JOG._write(f"{axis}PA{raw_target:.6f}")
-            JOG.local_offset["z"] = offset_target
-            JOG.focus_trim_mm += delta_offset
-            JOG._track_manual_target_locked({**JOG.raw_position, "z": raw_target}, FOCUS_Z_SPEED_MM_S)
-        deadline = time.monotonic() + max(5.0, abs(raw_target-start)/FOCUS_Z_SPEED_MM_S*2 + 2)
-        while True:
-            with JOG._lock:
-                if not JOG.connected or generation != JOG._poll_generation:
-                    raise RuntimeError("Focus motion interrupted: controller connection changed.")
-                done = JOG._query(f"{axis}MD?").strip() == "1"
-                raw = JOG._read_axis_position(axis)
-                JOG.raw_position["z"] = raw
-                JOG.position["z"] = JOG._local_of("z", raw)
-                JOG._telemetry_at = time.monotonic()
-                if done and abs(raw-raw_target) <= .001:
-                    JOG._manual_target_raw = None
-                    JOG._manual_error = None
-                    return
-                if time.monotonic() >= deadline or JOG._manual_error:
-                    JOG._write("ST")
-                    JOG._manual_error = "Focus step did not reach its target; scan aborted. Check motion before retrying."
-                    raise RuntimeError(JOG._manual_error)
-            time.sleep(.02)
-
-    def _move_relative_confirmed(self, delta: float) -> None:
-        raw = JOG.current_raw_z(refresh=True)
-        with JOG._lock:
-            offset = JOG.local_offset["z"]
-        self._move_confirmed(raw + delta, offset + delta)
-
-    def _run_stage(
-        self,
-        stage: str,
-        range_mm: float,
-        step_mm: float,
-        direction: str = "both",
-        mech_settle: float = FOCUS_MECH_SETTLE_S,
-        exposure_margin: float = FOCUS_EXPOSURE_MARGIN_S,
-    ) -> focus_autocal.FocusScanResult:
-        raw_origin = JOG.current_raw_z(refresh=True)
-        with JOG._lock:
-            offset_origin = JOG.local_offset["z"]
-        offset = {"v": 0.0}
-        settled_at = {"t": time.monotonic()}
-
-        def move_to(target: float) -> None:
-            delta = target - offset["v"]
-            if abs(delta) <= 1e-9:
-                settled_at["t"] = time.monotonic()
-                return
-            self._move_confirmed(raw_origin + target, offset_origin + target)
-            # Mechanical settle only (vibration damping) -- camera timing is
-            # no longer covered by a blind extra dwell here; read_brightness
-            # below waits for a frame timestamped after this move instead.
-            time.sleep(mech_settle)
-            offset["v"] = target
-            settled_at["t"] = time.monotonic()
-
-        def read_brightness() -> float:
-            value = self._read_brightness(after_time=settled_at["t"], exposure_margin=exposure_margin)
-            with self._lock:
-                self.live_samples.append((offset["v"], value))
-            return value
-
-        with self._lock:
-            self.stage = stage
-            self.live_samples = []
-
-        if direction == "both":
-            # scan_focus_z's own "both" sweep starts at -range_mm and walks
-            # up to +range_mm in step_mm increments -- fine once it's
-            # underway, but its very FIRST move would jump straight from
-            # wherever we're sitting now (usually already near focus)
-            # directly to -range_mm in one shot. That single large move
-            # settles differently than the small steps the rest of the scan
-            # is tuned for and was skewing the early samples. So walk down
-            # to -range_mm ourselves first, in the same step_mm increments
-            # (measuring each stop for the live view, same as any other
-            # step) -- by the time scan_focus_z takes over, its first
-            # move_to(-range_mm) call is already a no-op and every move for
-            # the rest of the scan is a small step, never a jump. Position
-            # only here, no camera read: each read_brightness() now waits
-            # for and averages several fresh frames (see
-            # FOCUS_BRIGHTNESS_SAMPLES), so measuring at every one of these
-            # throwaway pre-walk steps was quietly doubling total scan time
-            # for data that was never going to be used anyway.
-            n_steps = max(1, round(range_mm / step_mm))
-            for i in range(1, n_steps + 1):
-                move_to(-i * step_mm)
-
-        result = focus_autocal.scan_focus_z(
-            move_z=move_to,
-            fire_pulse=lambda: None,  # laser is CW on this rig; nothing to trigger per step
-            read_brightness=read_brightness,
-            center_z=0.0,
-            range_mm=range_mm,
-            step_mm=step_mm,
-            settle_s=0.0,  # settle handled by move_to + the fresh-frame wait in read_brightness
-            direction=direction,
-        )
-        move_to(result.best_z)  # scan_focus_z itself leaves the stage at the last sample, not the peak
-        return result
-
-    def _claim_scan_locked(self) -> None:
-        """Caller must hold self._lock. Raises if not ready for one scan;
-        otherwise claims self.scanning. Does NOT check self.surveying --
-        used both by the public entry points (via _start_locked, which adds
-        that check) and from inside the survey worker's own loop, where
-        self.surveying is deliberately already True for the whole survey."""
-        if self.scanning:
-            raise RuntimeError("A focus scan is already running.")
-        jog_status = JOG._status_locked()  # caller holds JOG then focus lock
-        if JOG._run_state["running"] or jog_status["manualMotion"]["active"]:
-            raise RuntimeError("Wait for the current motion to finish before scanning focus.")
-        if jog_status["sensorHome"]["running"]:
-            raise RuntimeError("Central sensor homing is in progress. Wait before scanning focus.")
-        if not jog_status["connected"]:
-            raise RuntimeError("Jog not connected. Connect it live first.")
-        if jog_status["dryRun"]:
-            raise RuntimeError("Jog is in dry-run mode; connect live to scan focus.")
-        if not CAMERA.status()["connected"]:
-            raise RuntimeError("Camera not connected.")
-        self.scanning = True
-        self.error = None
-
-    def _start_locked(self) -> None:
-        """Caller must hold self._lock. Raises if not ready to scan;
-        otherwise claims self.scanning. For the public entry points only --
-        see _claim_scan_locked for the survey-internal variant."""
-        if self.surveying:
-            raise RuntimeError("A survey is in progress.")
-        self._claim_scan_locked()
-
-    def run(self, force_wide: bool = False, force_narrow: bool = False) -> dict:
-        with JOG._lock, self._lock:
-            self._start_locked()
-        threading.Thread(target=self._worker, args=(force_wide, force_narrow), daemon=True).start()
-        return self.status()
-
-    def run_latency_check(self) -> dict:
-        """Diagnostic: scan the same small Z window twice around the
-        current position -- once with a deliberately slow, generously
-        settled/exposed pass (as close to a lag-free reference as this rig
-        can get), once with the production fast timing -- and report how
-        far apart their peaks land. Large agreement validates that
-        wait_for_fresh() actually removed the camera-timing lag; a
-        remaining gap is real residual error to investigate further."""
-        with JOG._lock, self._lock:
-            self._start_locked()
-        threading.Thread(target=self._latency_worker, daemon=True).start()
-        return self.status()
-
-    def run_custom(
-        self,
-        range_mm: float,
-        step_mm: float,
-        direction: str = "both",
-        settle_s: float = FOCUS_MECH_SETTLE_S,
-        center_offset_mm: float = 0.0,
-    ) -> dict:
-        """One scan with fully caller-chosen direction/range/step/speed,
-        instead of the fixed wide/narrow presets -- for when you want to
-        aim the sweep yourself (e.g. only downward, a specific window
-        around a known feature) or trade speed for reliability by hand.
-        settle_s is used for both the mechanical settle after each move
-        and the fresh-frame exposure margin (see _run_stage) -- one dial
-        for "how fast", since splitting it in two is not what "속도" means
-        to the person turning the knob. center_offset_mm first moves that
-        far (relative to wherever the stage sits right now) before
-        sweeping -- this is what lets the UI turn "the point the user
-        dragged-selected on the last scan's chart" into an actual center,
-        since every scan's own samples are offsets from ITS start, not
-        absolute Z (see _run_stage's `offset` closure)."""
-        if range_mm <= 0 or step_mm <= 0:
-            raise RuntimeError("Range and step must both be positive.")
-        if direction not in ("both", "down", "up"):
-            raise RuntimeError("Direction must be 'both', 'down', or 'up'.")
-        if settle_s < 0:
-            raise RuntimeError("Settle time can't be negative.")
-        with JOG._lock, self._lock:
-            self._start_locked()
-        threading.Thread(
-            target=self._custom_worker, args=(range_mm, step_mm, direction, settle_s, center_offset_mm), daemon=True
-        ).start()
-        return self.status()
-
-    def _custom_worker(
-        self, range_mm: float, step_mm: float, direction: str, settle_s: float, center_offset_mm: float = 0.0
-    ) -> None:
-        try:
-            if abs(center_offset_mm) > 1e-9:
-                self._move_relative_confirmed(center_offset_mm)
-                time.sleep(settle_s)
-            result = self._run_stage(
-                "custom", range_mm, step_mm, direction=direction, mech_settle=settle_s, exposure_margin=settle_s
-            )
-            center_note = f", centered {center_offset_mm:+.4f}mm from prior position" if abs(center_offset_mm) > 1e-9 else ""
-            label = f"custom: {direction}, ±{range_mm}mm range, {step_mm}mm step, {settle_s}s settle{center_note}"
-            self._finish_scan(result, wide_result=None, label=label)
-        except Exception as exc:
-            with self._lock:
-                self.error = str(exc)
-        finally:
-            with self._lock:
-                self.scanning = False
-                self.stage = None
-
-    def start_survey(self, waypoints: list[tuple[float, float]], force_narrow: bool = False) -> dict:
-        """Walk (x, y) waypoints in order -- goto, wait for arrival, run one
-        focus scan (wide+narrow on the first waypoint if there's no
-        baseline yet, narrow after that, same as run()) -- so a 2D sweep
-        (e.g. a spiral) builds up a real X/Y -> Z-offset/brightness map in
-        focus_scan_log.csv, one logged row per waypoint, for free (the
-        per-scan logging in _worker already tags every row with x/y).
-        force_narrow skips wide on every point, including the first --
-        use this once you already trust the local Z (e.g. right after a
-        manual wide scan) and just want the survey to stay fast throughout."""
-        with JOG._lock, self._lock:
-            if self.scanning or self.surveying:
-                raise RuntimeError("A scan or survey is already running.")
-            jog_status = JOG._status_locked()
-            if JOG._run_state["running"] or jog_status["manualMotion"]["active"]:
-                raise RuntimeError("Wait for current motion before starting a survey.")
-            if jog_status["sensorHome"]["running"]:
-                raise RuntimeError("Central sensor homing is in progress. Wait before starting a survey.")
-            if not jog_status["connected"]:
-                raise RuntimeError("Jog not connected. Connect it live first.")
-            if jog_status["dryRun"]:
-                raise RuntimeError("Jog is in dry-run mode; connect live to run a survey.")
-            if not CAMERA.status()["connected"]:
-                raise RuntimeError("Camera not connected.")
-            if not waypoints:
-                raise RuntimeError("No waypoints given.")
-            self.surveying = True
-            self._survey_stop.clear()
-            self.survey = {"index": 0, "total": len(waypoints), "results": [], "error": None, "done": False}
-        threading.Thread(target=self._survey_worker, args=(list(waypoints), force_narrow), daemon=True).start()
-        return self.status()
-
-    def stop_survey(self) -> dict:
-        self._survey_stop.set()
-        return self.status()
-
-    def _wait_for_xy_arrival(self, x: float, y: float, timeout: float = 15.0, tol: float = 0.02) -> None:
-        """Poll position until within `tol` of (x, y) or timeout -- goto()
-        issues the move without waiting for arrival (see
-        _send_absolute_locked), so the survey loop needs its own wait
-        before it's safe to scan. A timeout just proceeds and scans wherever
-        the stage actually is, rather than aborting the whole survey over
-        one slow/stuck move."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            pos = JOG.status()["position"]
-            if abs(pos["x"] - x) <= tol and abs(pos["y"] - y) <= tol:
-                time.sleep(0.15)  # brief mechanical settle after arrival
-                return
-            time.sleep(0.05)
-
-    def _survey_worker(self, waypoints: list[tuple[float, float]], force_narrow: bool = False) -> None:
-        try:
-            for index, (x, y) in enumerate(waypoints):
-                if self._survey_stop.is_set():
-                    break
-                jog_status = JOG.status()
-                if not jog_status["connected"] or jog_status["dryRun"]:
-                    raise RuntimeError("Jog connection lost during survey.")
-                JOG.goto(x, y, jog_status["position"]["z"])  # z unchanged -> goto()'s trend-prediction fills it in when active
-                self._wait_for_xy_arrival(x, y)
-                if self._survey_stop.is_set():
-                    break
-
-                with JOG._lock, self._lock:
-                    self._claim_scan_locked()
-                # Synchronous: _worker catches its own exceptions (sets
-                # self.error) and always resets self.scanning itself in its
-                # finally block, so one bad point can't wedge the survey.
-                self._worker(force_wide=not self.has_baseline, force_narrow=force_narrow)
-
-                with self._lock:
-                    entry_error = self.error
-                    self.error = None  # per-point error lives on the entry, not the shared field
-                    self.survey["results"].append(
-                        {
-                            "index": index,
-                            "x": x,
-                            "y": y,
-                            "result": dict(self.last_result) if self.last_result and not entry_error else None,
-                            "error": entry_error,
-                        }
-                    )
-                    self.survey["index"] = index + 1
-        except Exception as exc:
-            with self._lock:
-                if self.survey is not None:
-                    self.survey["error"] = str(exc)
-        finally:
-            with self._lock:
-                self.surveying = False
-                if self.survey is not None:
-                    self.survey["done"] = True
-
-    def _worker(self, force_wide: bool, force_narrow: bool = False) -> None:
-        try:
-            wide_result = None
-            if not force_narrow and (force_wide or not self.has_baseline):
-                wide_result = self._run_stage("wide", FOCUS_WIDE_RANGE_MM, FOCUS_WIDE_STEP_MM, direction="down")
-            fine_result = self._run_stage("narrow", FOCUS_NARROW_RANGE_MM, FOCUS_NARROW_STEP_MM)
-            self._finish_scan(fine_result, wide_result)
-        except Exception as exc:
-            with self._lock:
-                self.error = str(exc)
-        finally:
-            with self._lock:
-                self.scanning = False
-                self.stage = None
-
-    def _finish_scan(
-        self,
-        primary_result: focus_autocal.FocusScanResult,
-        wide_result: focus_autocal.FocusScanResult | None,
-        label: str | None = None,
-    ) -> None:
-        """Shared bookkeeping after any completed scan (the wide+narrow
-        pair from _worker, or a single custom-parameter stage from
-        _custom_worker): mark has_baseline, record the trend-plane sample,
-        set last_result, append to the CSV log. `primary_result` is the
-        one whose best_z becomes the reported offset/target position."""
-        values = [v for _, v in (wide_result.samples if wide_result else [])] + [v for _, v in primary_result.samples]
-        settled = JOG.status()["position"]
-        settled_raw_z = JOG.current_raw_z(refresh=True)
-        peak_brightness = max(values) if values else None
-        # Quality metrics from the narrow/primary curve only (not concatenated
-        # with wide) -- wide and narrow cover different Z ranges, so joining
-        # them end to end would count the seam between the two as a fake jump.
-        quality = _scan_quality_metrics(primary_result.samples)
-        with self._lock:
-            self.has_baseline = True
-            self._plane_samples.append((settled["x"], settled["y"], settled["z"]))
-            if len(self._plane_samples) > FOCUS_PLANE_MAX_SAMPLES:
-                self._plane_samples.pop(0)
-            self._last_verified_raw_z = settled_raw_z
-            self._z_departed = False
-            self.last_result = {
-                "bestOffsetMm": primary_result.best_z,
-                "fitUsed": primary_result.fit_used,
-                "peakBrightness": peak_brightness,
-                "usedWide": wide_result is not None,
-                "refinedPoints": primary_result.refined_points + (wide_result.refined_points if wide_result else 0),
-                "label": label,
-                "quality": quality,
-                "samples": {
-                    "wide": [[z, v] for z, v in wide_result.samples] if wide_result else [],
-                    "narrow": [[z, v] for z, v in primary_result.samples],
-                },
-                "timestamp": time.time(),
-            }
-        self._append_log(settled, primary_result, wide_result is not None, peak_brightness)
-        _append_csv_row(
-            FOCUS_QUALITY_LOG_PATH,
-            ["timestamp_utc", "x_mm", "y_mm", "z_mm", "label", "n_samples", "zero_dropouts", "zero_dropout_pct", "roughness_tv_over_peak"],
-            [
-                datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                round(settled["x"], 4),
-                round(settled["y"], 4),
-                round(settled["z"], 4),
-                label or "",
-                quality["n"],
-                quality["zeroCount"],
-                quality["zeroPct"],
-                quality["roughness"],
-            ],
-        )
-        self._save_focus_photo(settled, primary_result, label, peak_brightness)
-
-    def _save_focus_photo(
-        self,
-        settled: dict,
-        primary_result: focus_autocal.FocusScanResult,
-        label: str | None,
-        peak_brightness: float | None,
-    ) -> None:
-        """Snap and save the camera's current (already blob-annotated) frame
-        right after a scan lands the stage on its detected focus -- a visual
-        record of what "in focus" looked like at that X/Y, alongside the
-        numeric log. Best-effort and never raises: a missed photo must not
-        take the scan result down with it.
-
-        Waits for a frame timestamped after this call, same reasoning as
-        _read_brightness's wait_for_fresh use -- the stage has already
-        settled at this point (_run_stage's move_to already slept through
-        the move + mech settle before returning), so this just avoids the
-        remaining sliver of a chance of grabbing a frame the capture loop
-        had cached from just before that settle."""
-        try:
-            status = CAMERA.wait_for_fresh(time.monotonic(), timeout=FOCUS_PHOTO_WAIT_TIMEOUT_S)
-            if not status.get("connected"):
-                return
-            jpeg = CAMERA.latest_jpeg()
-            if not jpeg:
-                return
-            FOCUS_PHOTO_DIR.mkdir(exist_ok=True)
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            filename = f"{stamp}_offset{primary_result.best_z:+.4f}mm.jpg"
-            (FOCUS_PHOTO_DIR / filename).write_bytes(jpeg)
-            _append_csv_row(
-                FOCUS_PHOTO_LOG_PATH,
-                ["timestamp_utc", "filename", "x_mm", "y_mm", "z_mm", "best_offset_mm", "peak_blob_score", "label"],
-                [
-                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                    filename,
-                    round(settled["x"], 4),
-                    round(settled["y"], 4),
-                    round(settled["z"], 4),
-                    round(primary_result.best_z, 6),
-                    round(peak_brightness, 1) if peak_brightness is not None else "",
-                    label or "",
-                ],
-            )
-        except Exception:
-            pass  # photo capture is diagnostic, never load-bearing
-
-    def _latency_worker(self) -> None:
-        # Deliberately generous: settle a full order of magnitude longer
-        # than production, and pad the fresh-frame wait with a big exposure
-        # margin, so this pass is as close to "no timing lag possible" as
-        # the rig can practically get -- the reference the fast pass is
-        # judged against.
-        SLOW_MECH_SETTLE_S = 0.4
-        SLOW_EXPOSURE_MARGIN_S = 0.3
-        range_mm = min(FOCUS_NARROW_RANGE_MM, 0.1)
-        step_mm = 0.005
-        try:
-            slow_result = self._run_stage(
-                "latency-slow", range_mm, step_mm, direction="both",
-                mech_settle=SLOW_MECH_SETTLE_S, exposure_margin=SLOW_EXPOSURE_MARGIN_S,
-            )
-            # _run_stage already moved to slow_result.best_z. Return to this
-            # check's starting Z so the fast pass scans the identical
-            # absolute window, not one re-centered on the slow pass's peak.
-            self._move_relative_confirmed(-slow_result.best_z)
-            time.sleep(SLOW_MECH_SETTLE_S)
-
-            fast_result = self._run_stage("latency-fast", range_mm, step_mm, direction="both")
-
-            delta_mm = fast_result.best_z - slow_result.best_z
-            with self._lock:
-                self.latency_check = {
-                    "rangeMm": range_mm,
-                    "stepMm": step_mm,
-                    "slowBestOffsetMm": slow_result.best_z,
-                    "fastBestOffsetMm": fast_result.best_z,
-                    "deltaMm": delta_mm,
-                    "impliedLagS": abs(delta_mm) / FOCUS_Z_SPEED_MM_S,
-                    "slowFitUsed": slow_result.fit_used,
-                    "fastFitUsed": fast_result.fit_used,
-                    "slowSamples": [[z, v] for z, v in slow_result.samples],
-                    "fastSamples": [[z, v] for z, v in fast_result.samples],
-                    "timestamp": time.time(),
-                }
-        except Exception as exc:
-            with self._lock:
-                self.error = str(exc)
-        finally:
-            with self._lock:
-                self.scanning = False
-                self.stage = None
-
-    def _append_log(
-        self,
-        settled: dict,
-        fine_result: focus_autocal.FocusScanResult,
-        used_wide: bool,
-        peak_brightness: float | None,
-    ) -> None:
-        """Append one row per completed scan to FOCUS_LOG_PATH so results
-        survive server restarts and can be reviewed/plotted afterward --
-        the in-memory lastResult only ever holds the most recent scan."""
-        try:
-            is_new = not FOCUS_LOG_PATH.exists()
-            with FOCUS_LOG_PATH.open("a", newline="", encoding="utf-8") as handle:
-                writer = csv.writer(handle)
-                if is_new:
-                    writer.writerow(
-                        ["timestamp_utc", "x_mm", "y_mm", "z_mm", "best_offset_mm", "fit_used", "peak_blob_score", "used_wide", "plane_samples"]
-                    )
-                writer.writerow(
-                    [
-                        datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                        round(settled["x"], 4),
-                        round(settled["y"], 4),
-                        round(settled["z"], 4),
-                        round(fine_result.best_z, 6),
-                        fine_result.fit_used,
-                        round(peak_brightness, 1) if peak_brightness is not None else "",
-                        used_wide,
-                        len(self._plane_samples),
-                    ]
-                )
-        except OSError:
-            pass  # logging is best-effort; never let a disk hiccup break the scan
-
-    def set_active(self, enabled: bool) -> dict:
-        with JOG._lock, self._lock:
-            if enabled and JOG._sensor_home_state["running"]:
-                raise RuntimeError("Wait for central sensor homing before enabling autofocus.")
-            changed = enabled != self.active
-            self.active = enabled
-        # status() takes the same non-reentrant lock. Duplicate requests
-        # must return after releasing it, including a repeated disable.
-        if not changed:
-            return self.status()
-        if enabled:
-            self._stop_event.clear()
-            self._xy_event.clear()
-            watcher = threading.Thread(target=self._watch_loop, daemon=True)
-            self._watcher = watcher
-            watcher.start()
-        else:
-            self._stop_event.set()
-            self._xy_event.set()
-        return self.status()
-
-    def _watch_loop(self) -> None:
-        while not self._stop_event.is_set():
-            triggered = self._xy_event.wait(timeout=1.0)
-            if self._stop_event.is_set():
-                break
-            if not triggered:
-                continue
-            self._xy_event.clear()
-            time.sleep(FOCUS_XY_DEBOUNCE_S)  # batch rapid multi-step jogging into one rescan
-            if self._stop_event.is_set() or not self.active:
-                continue
-            # X/Y commands return before arrival. Claim a scan only after
-            # the move's monitor confirms standstill, not after a fixed delay.
-            while JOG.status()["manualMotion"]["active"] and not self._stop_event.wait(.05):
-                pass
-            if self._stop_event.is_set():
-                break
-            try:
-                self.run(force_wide=False)
-            except RuntimeError:
-                continue  # already scanning, or hardware not ready -- try again next move
-            deadline = time.monotonic() + 30.0
-            while self.scanning and time.monotonic() < deadline:
-                time.sleep(0.1)
-
-
-FOCUS = FocusScanner()
-
-
 def prepare_wsl_bridge() -> None:
     """Prepare this project's local bridge, without any stage commands."""
     if os.name != "nt":
@@ -2886,12 +1975,9 @@ def connect_jog_request(request: dict) -> dict:
         dry = request.get("dryRun", True)
         auto = request.get("prepareWsl") is True
         if not auto:
-            return JOG.connect(port, baud, dry, request.get("rangeXYMm"), request.get("rangeZMm"))
+            return JOG.connect(port, baud, dry)
         if port != "rfc2217://127.0.0.1:22170" or dry is not False:
             raise RuntimeError("Use WSL requires the local WSL bridge and Live mode.")
-        focus = FOCUS.status()
-        if focus["scanning"] or focus["surveying"]:
-            raise RuntimeError("초점 동작 완료 후 연결하세요.")
         with JOG._lock:
             JOG._require_no_sensor_home_locked()
             JOG._require_no_run_locked()
@@ -2910,7 +1996,7 @@ def connect_jog_request(request: dict) -> dict:
         CONNECTION_PREPARATION["phase"] = "실제 제어기 응답 확인 중 (VE)"
         probe = JOG.probe_link(port, baud)
         CONNECTION_PREPARATION["phase"] = "실제 장비 연결 중"
-        result = JOG.connect(port, baud, False, request.get("rangeXYMm"), request.get("rangeZMm"), expected_generation=generation)
+        result = JOG.connect(port, baud, False, expected_generation=generation)
         result["versionReply"] = probe["versionReply"]
         result["connectionPreparation"] = {"active": False, "phase": None, "error": None}
         return result
@@ -2920,14 +2006,6 @@ def connect_jog_request(request: dict) -> dict:
     finally:
         CONNECTION_PREPARATION.update(active=False, phase=None)
         CONNECTION_LOCK.release()
-
-
-def read_focus_log(limit: int) -> list[dict]:
-    if not FOCUS_LOG_PATH.exists():
-        return []
-    with FOCUS_LOG_PATH.open("r", newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-    return rows[-max(1, limit) :]
 
 
 def optional_float(value: object) -> float | None:
@@ -3115,6 +2193,10 @@ def build_segments(
     feed_rate = float(metadata.get("feed_rate", DEFAULT_FEED_RATE_MM_S))
     travel_rate = float(metadata.get("travel_rate", DEFAULT_TRAVEL_RATE_MM_S))
     focus_z = float(metadata.get("focus_z_mm", DEFAULT_FOCUS_Z_MM))
+    drawing_depth = float(metadata.get("drawing_depth_mm", 0.0))
+    if not math.isfinite(drawing_depth) or drawing_depth < 0:
+        raise ValueError("Drawing entry depth must be a finite non-negative distance in mm.")
+    cut_z = focus_z + drawing_depth
     z_defocus_mm = abs(float(metadata.get("z_defocus_mm", DEFAULT_Z_DEFOCUS_MM)))
     defocus_z = focus_z - z_defocus_mm
     z_speed = max(float(metadata.get("z_speed_mm_s", DEFAULT_Z_SPEED_MM_S)), 0.001)
@@ -3190,7 +2272,7 @@ def build_segments(
         # of a path, along the defocus direction, to compensate for
         # material recession over multiple passes.
         pass_index = pass_indices[index] if pass_indices and index < len(pass_indices) else 0
-        pass_focus_z = focus_z - (pass_index // Z_STEP_BACK_PASSES) * Z_STEP_BACK_MM
+        pass_focus_z = cut_z - (pass_index // Z_STEP_BACK_PASSES) * Z_STEP_BACK_MM
         add_z_segment("z-focus", current, pass_focus_z, source_id, layer)
 
         for start, end in zip(points, points[1:]):
@@ -3416,6 +2498,7 @@ def build_plan(session: dict, request: dict) -> dict:
         "path_passes": pass_counts,
         "optimize": optimize,
         "focus_z_mm": float(request.get("focusZMm", session["metadata"].get("focus_z_mm", DEFAULT_FOCUS_Z_MM))),
+        "drawing_depth_mm": float(request.get("drawingDepthMm", session["metadata"].get("drawing_depth_mm", 0.0))),
         "z_defocus_mm": float(request.get("zDefocusMm", session["metadata"].get("z_defocus_mm", DEFAULT_Z_DEFOCUS_MM))),
         "z_speed_mm_s": float(request.get("zSpeedMmS", session["metadata"].get("z_speed_mm_s", DEFAULT_Z_SPEED_MM_S))),
         "position_tolerance_mm": float(
@@ -3465,10 +2548,15 @@ def trace_file(source: Path, params: dict) -> dict:
         flatness_mm=flatness_mm,
         unit_scale=CURVE_FLATTENING_SCALE_HINT,
         min_length_mm=min_length_mm,
+        skip_watermark=False,
     )
+    # Preserve the previously supported legacy filter's pre-fit behavior.
+    raw_paths = skip_known_aspose_watermark(raw_paths, skipped, include_framed=False)
     if trace_mode == "design" and not params.get("includeLayers"):
         raw_paths = select_design_paths(raw_paths, skipped)
-    if not raw_paths:
+    kept_ids = {id(p) for p in skip_known_aspose_watermark(raw_paths, skipped)}
+    keep_mask = [id(p) in kept_ids for p in raw_paths]
+    if not kept_ids:
         raise RuntimeError("No drawable paths found after trace filters.")
 
     # Rotate the drawing about its own center before fit scaling; for a
@@ -3501,6 +2589,9 @@ def trace_file(source: Path, params: dict) -> dict:
         max_segment_mm=float(params.get("maxSegmentMm", 0.0)),
     )
 
+    # Keep the original fit/rotation frame so hiding converter outlines does
+    # not resize or move the user's existing design on the stage.
+    machine_paths = [p for p, keep in zip(machine_paths, keep_mask) if keep]
     payload_paths = [laser_path_to_payload(index, laser_path) for index, laser_path in enumerate(machine_paths)]
     circle_info = circle_check(machine_paths, FIXED_REFERENCE_CIRCLE_DIAMETER_MM)
     metadata = {
@@ -3696,15 +2787,6 @@ class VisualizerHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/camera/stream":
             self.handle_camera_stream()
             return
-        if parsed.path == "/api/focus/status":
-            self.send_json(FOCUS.status())
-            return
-        if parsed.path == "/api/focus/log":
-            query = parse_qs(parsed.query)
-            limit = int(query.get("limit", ["200"])[0])
-            self.send_json({"rows": read_focus_log(limit)})
-            return
-
         path = parsed.path.lstrip("/") or "index.html"
         target = (STATIC_ROOT / path).resolve()
         if not str(target).startswith(str(STATIC_ROOT.resolve())) or not target.exists():
@@ -3743,8 +2825,7 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/audit/status":
                 self.send_json(app_audit.RECORDER.health())
             elif parsed.path == "/api/server/stop":
-                focus_state = FOCUS.status()
-                if JOG.run_status()["running"] or focus_state.get("scanning") or focus_state.get("surveying"):
+                if JOG.run_status()["running"]:
                     raise RuntimeError("A machine operation is running. Stop physical motion before shutting down the server.")
                 self.send_json({"stopping": True})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
@@ -3766,6 +2847,8 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/jog/probe":
                 request = self.read_json()
                 self.send_json(JOG.probe_link(request.get("port", "COM5"), request.get("baudrate", JOG_DEFAULT_BAUDRATE)))
+            elif parsed.path == "/api/jog/z-limit":
+                self.send_json(JOG.set_z_max(self.read_json().get("zMaxMm")))
             elif parsed.path == "/api/jog/connect":
                 request = self.read_json()
                 self.send_json(connect_jog_request(request))
@@ -3791,6 +2874,16 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/jog/goto":
                 request = self.read_json()
                 self.send_json(JOG.goto(request.get("x", 0), request.get("y", 0), request.get("z", 0)))
+            elif parsed.path == '/api/jog/ready/save':
+                self.send_json(JOG.save_ready_position(self.read_json().get('position')))
+            elif parsed.path == '/api/jog/ready/capture':
+                self.send_json(JOG.capture_ready_position(self.read_json().get('mode')))
+            elif parsed.path == '/api/jog/ready/move':
+                request = self.read_json()
+                actions = {'xy': JOG.move_to_saved_xy, 'z': JOG.move_to_saved_z, 'xyz': JOG.move_to_saved_xyz}
+                if request.get('axes') not in actions:
+                    raise ValueError('Ready axes must be xy, z or xyz.')
+                self.send_json(actions[request['axes']](request.get('mode')))
             elif parsed.path == "/api/run/start":
                 request = self.read_json()
                 self.send_json(JOG.run_plan(request.get("segments", []), record_diagnostics=request.get("recordDiagnostics") is True))
@@ -3811,37 +2904,6 @@ class VisualizerHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/camera/select-target":
                 request = self.read_json()
                 self.send_json(CAMERA.select_target(float(request["x"]), float(request["y"])))
-            elif parsed.path == "/api/focus/scan":
-                request = self.read_json()
-                self.send_json(FOCUS.run(force_wide=bool(request.get("wide", False)), force_narrow=bool(request.get("narrowOnly", False))))
-            elif parsed.path == "/api/focus/search":
-                request = self.read_json()
-                self.send_json(FOCUS.run_search(float(request["xyRangeMm"]), float(request["xyStepMm"]),
-                                                float(request["zRangeMm"]), float(request["zStepMm"])))
-            elif parsed.path == "/api/focus/search/stop":
-                self.send_json(FOCUS.stop_search())
-            elif parsed.path == "/api/focus/active":
-                request = self.read_json()
-                self.send_json(FOCUS.set_active(bool(request.get("enabled", False))))
-            elif parsed.path == "/api/focus/latency-check":
-                self.send_json(FOCUS.run_latency_check())
-            elif parsed.path == "/api/focus/scan/custom":
-                request = self.read_json()
-                self.send_json(
-                    FOCUS.run_custom(
-                        range_mm=float(request.get("rangeMm", 0.1)),
-                        step_mm=float(request.get("stepMm", 0.005)),
-                        direction=str(request.get("direction", "both")),
-                        settle_s=float(request.get("settleS", FOCUS_MECH_SETTLE_S)),
-                        center_offset_mm=float(request.get("centerOffsetMm", 0.0)),
-                    )
-                )
-            elif parsed.path == "/api/focus/survey/start":
-                request = self.read_json()
-                waypoints = [(float(p[0]), float(p[1])) for p in request.get("waypoints", [])]
-                self.send_json(FOCUS.start_survey(waypoints, force_narrow=bool(request.get("narrowOnly", False))))
-            elif parsed.path == "/api/focus/survey/stop":
-                self.send_json(FOCUS.stop_survey())
             else:
                 self.send_error(404)
         except Exception as exc:
@@ -4047,7 +3109,6 @@ def main() -> int:
 
 app_audit.install_observers(JogController, lambda controller: DEPTH_CONTEXT.observe(controller, JOG_AXES, ESP300_AXIS_SIGNS))
 app_audit.install_observers(CameraController, lambda controller: None)
-app_audit.install_observers(FocusScanner, lambda controller: None)
 
 if __name__ == "__main__":
     raise SystemExit(main())

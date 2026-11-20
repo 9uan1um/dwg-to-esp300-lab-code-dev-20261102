@@ -1,6 +1,7 @@
 """Server-side trial compilation into the existing JogController run mechanism."""
 import math
 import app_audit
+from z_limit import check_z_target
 from esp300_connection import ESP300_AXES, ESP300_AXIS_SIGNS
 
 def reference_context(jog):
@@ -66,8 +67,8 @@ def compile_trial(recipe, pose, xy_speed, directions, controller, reference=None
     def add(target,speed,kind,site,zonly):
         nonlocal current
         if not all(math.isfinite(v) for v in target):raise ValueError('Nonfinite target')
-        if math.hypot(target[0]-controller.limit_center[0],target[1]-controller.limit_center[1])>controller.limit_radius:raise ValueError('Trial exceeds existing XY limit')
-        if abs(target[2]-controller.home_ref['z'])>controller.z_range:raise ValueError('Trial exceeds existing Z limit')
+        if zonly:
+            check_z_target(controller._raw_of("z", target[2]), controller.z_max_mm)
         distance=math.dist(current,target)
         segments.append({'from3':current,'to3':list(target),'speedMmS':speed,'duration':max(distance/speed,.001),'zOnly':zonly,'kind':kind,'pathIndex':site,'layer':'substrate','substrateTrial':True,'beamState':'unknown; assume continuous exposure'})
         current=list(target)

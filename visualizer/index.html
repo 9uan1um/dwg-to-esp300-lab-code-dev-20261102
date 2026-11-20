@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>DWG to ESP300 Path Planner</title>
-    <link rel="stylesheet" href="styles.css?v=point-test-20261103" />
+    <link rel="stylesheet" href="styles.css?v=ready-20261118" />
   </head>
   <body>
     <header class="global-nav">
@@ -52,6 +52,7 @@
             <label>Cut speed (mm/s) <input id="feedRate" type="number" step="0.1" value="0.4" /></label>
             <label>Travel speed (mm/s) <input id="travelRate" type="number" step="0.1" value="1.0" /></label>
             <label>Z speed (mm/s) <input id="zSpeed" type="number" step="0.1" value="0.3" /></label>
+            <label>도면 진입 깊이 (로컬 Z+, mm) <input id="drawingDepth" type="number" min="0" step="0.001" value="0" required /></label>
             <label class="check"><input id="optimizeToggle" type="checkbox" checked /><span>Optimize path</span></label>
             <button id="exportButton" class="primary-action" type="button">Download code</button>
           </div>
@@ -109,71 +110,6 @@
           <div class="camera-brightness" id="cameraSpotText">Spot: -</div>
         </section>
 
-        <section class="focus-panel">
-          <div class="panel-title">Camera autofocus (XYZ)</div>
-          <label class="check"><input id="focusSearchXY" type="checkbox" checked /><span>Scan focus: XY에서 시료 신호 찾기 + Z 초점</span></label>
-          <div class="focus-custom">
-            <label>XY 범위 (각 축 ±mm)<input id="focusSearchRange" type="number" min="0.001" step="0.1" placeholder="탐색 범위 입력" /></label>
-            <label>XY 간격 (mm)<input id="focusSearchStep" type="number" min="0.001" step="0.01" value="0.25" /></label>
-            <label>Z 범위 (±mm)<input id="focusSearchZRange" type="number" min="0.001" step="0.01" value="0.1" /></label>
-            <label>Z 간격 (mm)<input id="focusSearchZStep" type="number" min="0.001" step="0.001" value="0.02" /></label>
-          </div>
-          <div class="camera-brightness">현재 위치 기준으로 탐색합니다. 카메라에 발광이 보여야 판정할 수 있습니다. 실패·중지 시 마지막 위치에 머뭅니다. Wide / Narrow는 Z만 탐색합니다.</div>
-          <div class="focus-actions">
-            <button id="focusScanButton" class="primary-action" type="button">Scan focus</button>
-            <button id="focusScanWideButton" class="secondary-action" type="button">Wide rescan</button>
-            <button id="focusScanNarrowButton" class="secondary-action" type="button">Narrow only</button>
-            <button id="focusSearchStop" class="secondary-action" type="button">Stop XYZ search</button>
-          </div>
-          <label class="check focus-active-toggle"><input id="focusActiveToggle" type="checkbox" /><span>Active (auto-refocus on X/Y move)</span></label>
-          <div class="camera-status" id="focusStatusText">Idle</div>
-          <div class="camera-brightness" id="focusResultText">No scan yet.</div>
-
-          <div class="focus-chart-wrap">
-            <svg class="focus-chart" id="focusChart" viewBox="0 0 480 200" preserveAspectRatio="none"></svg>
-            <div class="focus-chart-hint" id="focusChartHint">Drag on the graph to select a range around a peak.</div>
-          </div>
-          <div class="camera-brightness" id="focusSelectionText">No range selected.</div>
-
-          <details class="focus-details">
-            <summary>Custom scan</summary>
-            <div class="focus-custom">
-              <label>Direction
-                <select id="focusCustomDirection">
-                  <option value="both">Both (+-)</option>
-                  <option value="down">Down only</option>
-                  <option value="up">Up only</option>
-                </select>
-              </label>
-              <label>Range (mm) <input id="focusCustomRange" type="number" step="0.001" min="0.001" value="0.1" /></label>
-              <label>Step (mm) <input id="focusCustomStep" type="number" step="0.001" min="0.001" value="0.005" /></label>
-              <label>Settle (s) <input id="focusCustomSettle" type="number" step="0.01" min="0" value="0.05" /></label>
-              <button id="focusCustomButton" class="primary-action" type="button">Run custom scan</button>
-            </div>
-          </details>
-
-          <details class="focus-details">
-            <summary>Timing check</summary>
-            <button id="focusLatencyButton" class="secondary-action" type="button">Verify timing (slow vs fast)</button>
-            <div class="camera-brightness" id="focusLatencyText">No timing check yet.</div>
-          </details>
-
-          <details class="focus-details">
-            <summary>Spiral survey</summary>
-            <label class="check focus-active-toggle"><input id="focusSurveyNarrowToggle" type="checkbox" /><span>Narrow only (skip wide, even on point 1)</span></label>
-            <div class="focus-actions">
-              <button id="focusSurveyButton" class="primary-action" type="button">Survey spiral path</button>
-              <button id="focusSurveyStopButton" class="secondary-action" type="button">Stop survey</button>
-            </div>
-            <div class="camera-status" id="focusSurveyStatusText">No survey yet.</div>
-            <div class="focus-chart-wrap">
-              <svg class="focus-chart" id="focusSurveyMap" viewBox="0 0 480 260" preserveAspectRatio="none"></svg>
-              <div class="focus-chart-hint" id="focusSurveyMapHint">X/Y map fills in live as the survey runs.</div>
-            </div>
-            <div class="camera-brightness" id="focusSurveyMapTip">Hover a point for detail.</div>
-          </details>
-        </section>
-
         <div class="panel-tabs" role="tablist">
           <button class="panel-tab active" type="button" data-tab="jog">Jog</button>
           <button class="panel-tab" type="button" data-tab="shapes">Shapes</button>
@@ -188,8 +124,6 @@
                 <label>Port / bridge address <input id="jogPort" type="text" value="" placeholder="COM port or rfc2217://127.0.0.1:22170" /></label>
                 <label>Windows COM ports <select id="jogWindowsPorts"><option value="">Select a detected port</option></select></label>
                 <label>Baud <input id="jogBaud" type="number" step="1" value="19200" /></label>
-                <label>X/Y range (mm) <input id="jogRangeXY" type="number" step="1" value="75" /></label>
-                <label>Z range (mm) <input id="jogRangeZ" type="number" step="1" value="20" /></label>
                 <label class="check"><input id="jogDryRun" type="checkbox" checked /><span>Dry run (no hardware)</span></label>
               </div>
               <div class="jog-connect-actions">
@@ -234,7 +168,7 @@
                 <button id="jogZMinus" class="jog-key" type="button" data-axis="z" data-dir="-1">Z focus -</button>
               </div>
               <div class="jog-run-actions jog-home-actions">
-                <button id="jogHomeButton" class="secondary-action" type="button">Home (0, 0, 0)</button>
+                <button id="jogHomeButton" class="secondary-action" type="button">Local (0, 0, 0)</button>
                 <button id="jogSensorHomeButton" class="secondary-action" type="button" title="Find the central origin sensors on X, Y, then Z">Center (sensors)</button>
                 <button id="jogSetLocalHomeButton" class="secondary-action" type="button">Set local home (도면 중심·초점 등록)</button>
                 <button id="jogGoLocalHomeButton" class="secondary-action" type="button">Go to local home</button>
@@ -242,18 +176,46 @@
               <div class="jog-hint" id="jogSensorHomeStatus" role="status" aria-live="polite">Center uses the machine sensors; Home moves to local (0, 0, 0).</div>
 
               <div class="jog-goto">
-                <span>Go to (mm)</span>
+                <span>Go to · 로컬 기준 (mm)</span>
                 <div class="jog-goto-fields">
                   <input id="jogGotoX" type="number" step="0.001" placeholder="X" />
                   <input id="jogGotoY" type="number" step="0.001" placeholder="Y" />
-                  <input id="jogGotoZ" type="number" step="0.001" placeholder="Z" />
+                  <input id="jogGotoZ" type="number" step="any" placeholder="Z" />
                   <button id="jogGotoButton" class="primary-action" type="button">Go</button>
                 </div>
               </div>
-              <div class="jog-position" id="jogPositionText">X 12.500 / Y 12.500 / Z 0.000</div>
-              <div class="jog-hint" id="jogMachinePosition"></div>
+              <div class="jog-coordinates">
+                <div class="jog-position" id="jogMachinePosition">기계 HOME 기준 · 좌표 미수신</div>
+                <div class="jog-position" id="jogPositionText">Set local home 기준 · 좌표 미수신</div>
+              </div>
+              <fieldset class="ready-panel">
+                <legend>Ready</legend>
+                <div class="ready-actions">
+                  <button id="readyXY" class="primary-action" type="button" disabled title="설정한 기계 X·Y로 이동 · Z 유지">XY</button>
+                  <button id="readyZ" class="primary-action" type="button" disabled title="설정한 기계 Z로 이동 · X·Y 유지">Z</button>
+                  <button id="readyXYZ" class="primary-action" type="button" disabled title="설정한 기계 X·Y·Z로 이동">XYZ</button>
+                </div>
+                <div class="jog-hint" id="readySavedText">설정 위치 불러오는 중…</div>
+                <div class="jog-hint" id="readyStatus" role="status" aria-live="polite"></div>
+                <details class="ready-settings">
+                  <summary>설정 위치 · 기계 HOME 기준 (mm)</summary>
+                  <div class="ready-fields">
+                    <label>X<input id="readyX" type="number" step="0.00001" /></label>
+                    <label>Y<input id="readyY" type="number" step="0.00001" /></label>
+                    <label>Z<input id="readyPositionZ" type="number" step="0.00001" /></label>
+                  </div>
+                  <div class="ready-save-actions">
+                    <button id="readySave" type="button" disabled>설정값 저장</button>
+                    <button id="readyCapture" type="button" disabled>현재 위치 저장</button>
+                  </div>
+                </details>
+              </fieldset>
               <div class="jog-hint" id="jogManualStatus" role="status" aria-live="polite"></div>
-              <div class="jog-position jog-limit-text" id="jogLimitText"></div>
+              <div class="jog-connect">
+                <label>기계 절대 Z 상한 (mm) <input id="jogZMax" type="number" step="any" /></label>
+                <button type="button" id="jogSaveZMax" disabled>상한 저장</button>
+              </div>
+              <div class="jog-position jog-limit-text" id="jogLimitText" role="status"></div>
               <div class="jog-hint">Hold a button to jog continuously. Arrow keys move X/Y, Page Up/Down move Z, Space is E-STOP.</div>
 
               <div class="jog-run">
@@ -263,12 +225,30 @@
                   <select id="testSelect">
                     <option value="substrate">Substrate Test</option>
                     <option value="point" selected>Point Test (Z only)</option>
+                    <option value="line">Line Test (Y 직선)</option>
+                    <option value="circle">Circle Test (현재 위치 중심)</option>
                   </select>
                 </label>
                 <div id="pointTestSettings" class="point-test-settings" hidden>
                   <label>Depth (mm)<input id="pointDepth" type="number" min="0.001" step="0.001" value="3" /></label>
                   <label>Ingress (mm/s)<input id="pointIngressSpeed" type="number" min="0.01" max="10" step="0.01" value="0.01" /></label>
+                  <label>Repeat count (반복횟수)<input id="pointRepeatCount" type="number" min="1" step="1" value="1" /></label>
                   <span class="jog-hint">Z+ 진입 · 복귀 1 mm/s 고정 · 실행 시작 Z로 복귀</span>
+                </div>
+                <div id="lineTestSettings" class="point-test-settings" hidden>
+                  <label>시작 진입 깊이 (Z+, mm)<input id="lineDepth" type="number" min="0" step="0.001" value="0" /></label>
+                  <label>한쪽 길이 (mm, 양수 → Y− / 음수 → Y+)<input id="lineLength" type="number" step="0.001" value="1" /></label>
+                  <label>Y 이동 속도 (mm/s)<input id="lineSpeed" type="number" min="0.01" max="10" step="0.01" value="1" /></label>
+                  <label class="check"><input id="lineRoundTrip" type="checkbox" /> Y 왕복</label>
+                  <label>Repeat count (반복횟수)<input id="lineRepeatCount" type="number" min="1" max="10000" step="1" value="1" /></label>
+                  <label>회차당 깊이 증가량 (mm)<input id="lineZStep" type="number" min="0" step="0.001" value="0" /></label>
+                </div>
+                <div id="circleTestSettings" class="point-test-settings" hidden>
+                  <label>반지름 (mm)<input id="circleRadius" type="number" min="0.001" step="0.001" value="1" /></label>
+                  <label>XY Speed (mm/s)<input id="circleSpeed" type="number" min="0.01" max="10" step="0.01" value="1" /></label>
+                  <label>반복횟수<input id="circleRepeatCount" type="number" min="1" max="1000" step="1" value="1" /></label>
+                  <label>초점까지 Z+ 이동 (mm)<input id="circleFocusOffset" type="number" min="0" step="0.001" value="0" /></label>
+                  <span class="jog-hint">실행 시 현재 XY가 원의 중심 · X+ 가장자리 → Z+ 초점 → 같은 높이에서 반복 → Z 복귀 → 중심 복귀. Z: 1 mm/s. 180개 직선 구간으로 원 근사; 실제 속도에는 구간별 가감속·통신 지연이 포함됩니다. 레이저 ON/OFF 제어 없음.</span>
                 </div>
                 <div class="jog-run-actions">
                   <button id="jogRunButton" class="primary-action" type="button">Run on machine</button>
@@ -358,6 +338,6 @@
         <button id="runConfirmStart" class="primary-action" type="button">시작 / Start</button>
       </div>
     </dialog>
-    <script type="module" src="app.js?v=camera-rotate-20261103"></script>
-  <script src="substrate-dialog.js?v=point-test-20261103"></script></body>
+    <script type="module" src="app.js?v=drawing-depth-20261118"></script>
+  <script src="substrate-dialog.js?v=line-20261118"></script></body>
 </html>

@@ -40,10 +40,6 @@ def dispatch(handler, app, action):
                 last_context=deepcopy(context)
             if action!='status' and handler.command!='POST':raise RuntimeError('POST required')
             body=handler.read_json() if handler.command=='POST' else {}
-            if action in ('set-upper-right','go-upper-right','run','point-run','real-preview','real-start'):
-                focus=app['FOCUS'].status()
-                if any(focus.get(k) for k in ('active','scanning','surveying')):
-                    raise RuntimeError('Autofocus 및 focus scan/survey를 종료한 후 substrate 기준 등록/이동을 실행하세요')
             if action=='status':
                 result=engine.snapshot()
                 result['original_connection']={'connected':connected,'dry_run':dry}
@@ -58,12 +54,12 @@ def dispatch(handler, app, action):
                 result['hardware_connected']=connected and not dry
                 result['live_allowed']=not blockers
                 result['blockers']=blockers
-                if getattr(engine,'controller_run',False) and jog._run_segments and jog._run_segments[0].get('pointTest'):
+                if getattr(engine,'controller_run',False) and jog._run_segments and any(jog._run_segments[0].get(k) for k in ('pointTest','lineTest','circleTest')):
                     run=jog.run_status()
-                    result['test_type']='point'
+                    result['test_type']='circle' if jog._run_segments[0].get('circleTest') else 'line' if jog._run_segments[0].get('lineTest') else 'point'
                     result['state']={'status':'running' if run['running'] else 'completed' if run.get('done') and not run.get('error') else 'stopped',
-                                     'phase':jog._run_segments[min(run['index'],1)]['kind'] if run['running'] else run.get('phase'),
-                                     'completed':run['index'],'total':2,'error':run.get('error'),'run_id':run.get('jobId')}
+                                     'phase':jog._run_segments[min(run['index'],len(jog._run_segments)-1)]['kind'] if run['running'] else run.get('phase'),
+                                     'completed':run['index'],'total':len(jog._run_segments),'error':run.get('error'),'run_id':run.get('jobId')}
                     result['position']=[jog.position[k] for k in 'xyz']
 
                 if getattr(engine,'controller_run',False) and jog._run_segments and jog._run_segments[0].get('substrateTrial'):
@@ -84,6 +80,18 @@ def dispatch(handler, app, action):
                 if moving or engine.state['status']=='running':raise RuntimeError('이미 동작 중입니다')
                 from point_test import start_point
                 result=start_point(jog,body)
+                engine.controller_run=True
+            elif action=='line-run':
+                raise ValueError('Line Test가 변경되었습니다. 페이지를 새로고침하세요.')
+            elif action=='line-path-run':
+                if moving or engine.state['status']=='running':raise RuntimeError('이미 동작 중입니다')
+                from line_test import start_line
+                result=start_line(jog,body)
+                engine.controller_run=True
+            elif action=='circle-run':
+                if moving or engine.state['status']=='running':raise RuntimeError('이미 동작 중입니다')
+                from circle_test import start_circle
+                result=start_circle(jog,body)
                 engine.controller_run=True
             elif action=='run':
                 if not connected:raise RuntimeError('장비 연결 필요: 자동 연결하지 않습니다')

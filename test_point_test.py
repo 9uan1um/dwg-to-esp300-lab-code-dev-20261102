@@ -45,7 +45,7 @@ class PointTests(unittest.TestCase):
                 raw[axes[int(command[0])]] = float(command[3:])
                 self.pa.set()
                 if mutate:
-                    self.jog.z_range += 1
+                    self.jog.local_offset['x'] += 1
         def query(command):
             if command == 'TE?':
                 return '0'
@@ -81,6 +81,21 @@ class PointTests(unittest.TestCase):
         z = app.JOG_AXES['z']
         self.assertEqual(self.commands, [f'{z}VA0.010000', f'{z}PA4.250000', f'{z}VA1.000000', f'{z}PA1.250000'])
 
+    def test_repeats_return_to_same_start_without_depth_accumulation(self):
+        self.live_fake()
+        point_test.start_point(self.jog, dict(mode='live', depth_mm=2.5, ingress_speed=.2, repeat_count=3))
+        result = self.finish()
+        self.assertTrue(result['done'])
+        self.assertEqual(result['index'], 6)
+        z = app.JOG_AXES['z']
+        self.assertEqual(self.commands, [f'{z}VA0.200000', f'{z}PA3.750000', f'{z}VA1.000000', f'{z}PA1.250000'] * 3)
+
+    def test_invalid_repeat_counts_never_start(self):
+        for repeats in (0, -1, True, 1.5, '3', None, float('inf')):
+            with self.subTest(repeats=repeats), self.assertRaisesRegex(ValueError, 'Repeat count'):
+                point_test.start_point(self.jog, dict(mode='mock', repeat_count=repeats))
+        self.assertIsNone(self.jog._run_thread)
+
     def test_point_needs_no_local_home_or_upper_right_after_sensor_home(self):
         self.live_fake()
         self.jog._alignment_required = True
@@ -100,8 +115,8 @@ class PointTests(unittest.TestCase):
         self.assertIsNone(self.jog._run_thread)
         self.jog.position['x'] = 100
         self.jog.raw_position['x'] = self.jog._raw_of('x', 100)
-        with self.assertRaisesRegex(ValueError, 'XY limit'):
-            point_test.start_point(self.jog, dict(mode='mock'))
+        point_test.start_point(self.jog, dict(mode='mock'))
+        self.assertTrue(self.finish()['done'])
 
     def test_connection_mode_and_busy_guards(self):
         with self.assertRaisesRegex(RuntimeError, '모드'):
@@ -120,7 +135,7 @@ class PointTests(unittest.TestCase):
 
     def test_stop_during_ingress_does_not_return(self):
         self.live_fake(moving=True)
-        point_test.start_point(self.jog, dict(mode='live'))
+        point_test.start_point(self.jog, dict(mode='live', repeat_count=3))
         self.assertTrue(self.pa.wait(1))
         self.jog.run_stop()
         result = self.finish()
@@ -131,7 +146,7 @@ class PointTests(unittest.TestCase):
 
     def test_fault_during_ingress_does_not_return(self):
         self.live_fake(fault=True)
-        point_test.start_point(self.jog, dict(mode='live'))
+        point_test.start_point(self.jog, dict(mode='live', repeat_count=3))
         result = self.finish()
         self.assertIn('Injected read fault', result['error'])
         self.assertTrue(result['stopConfirmed'])
@@ -139,13 +154,14 @@ class PointTests(unittest.TestCase):
 
     def test_resume_keeps_original_start_and_fixed_return(self):
         self.live_fake(moving=True)
-        started = point_test.start_point(self.jog, dict(mode='live'))
+        started = point_test.start_point(self.jog, dict(mode='live', repeat_count=3))
         self.assertTrue(self.pa.wait(1))
         self.jog.run_stop()
         self.assertTrue(self.finish()['resumable'])
         self.jog.run_resume(started['jobId'])
         self.assertTrue(self.finish()['done'])
         self.assertEqual(self.commands[-2:], ['3VA1.000000', '3PA1.250000'])
+        self.assertEqual(self.commands.count('3PA1.250000'), 3)
 
     def test_local_coordinate_offset_preserves_physical_start(self):
         self.jog.local_offset['z'] = 7.0
@@ -163,10 +179,9 @@ class PointTests(unittest.TestCase):
 
     def test_dispatch_and_point_status_without_substrate_reference(self):
         namespace = dict(JOG=self.jog, DEPTH_CONTEXT=app.DepthContext(), JOG_AXES=app.JOG_AXES,
-                         ESP300_AXIS_SIGNS=app.ESP300_AXIS_SIGNS, FOCUS=Mock())
-        namespace['FOCUS'].status.return_value = {}
+                         ESP300_AXIS_SIGNS=app.ESP300_AXIS_SIGNS)
         handler = Mock(command='POST')
-        handler.read_json.return_value = dict(mode='mock')
+        handler.read_json.return_value = dict(mode='mock', repeat_count=3)
         with patch.object(integration, 'engine', None), patch.object(integration, 'last_context', None):
             integration.dispatch(handler, namespace, 'point-run')
             handler.send_error_json.assert_not_called()
@@ -175,9 +190,12 @@ class PointTests(unittest.TestCase):
             integration.dispatch(handler, namespace, 'status')
             result = handler.send_json.call_args.args[0]
             self.assertEqual(result['test_type'], 'point')
-            self.assertEqual(result['state']['total'], 2)
-            self.assertEqual(result['state']['completed'], 2)
+            self.assertEqual(result['state']['total'], 6)
+            self.assertEqual(result['state']['completed'], 6)
             self.assertIsNone(result['upper_right'])
+            with patch.object(self.jog, 'run_status', return_value=dict(running=True, index=2)):
+                integration.dispatch(handler, namespace, 'status')
+            self.assertEqual(handler.send_json.call_args.args[0]['state']['phase'], 'point_ingress')
 
 
 if __name__ == '__main__':

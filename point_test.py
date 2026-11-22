@@ -6,10 +6,13 @@ from esp300_connection import ESP300_AXES, ESP300_AXIS_SIGNS
 
 DEFAULT_DEPTH_MM = 3.0
 DEFAULT_INGRESS_MM_S = 0.01
+DEFAULT_REPEAT_COUNT = 1
 RETURN_MM_S = 1.0
 
 
-def compile_point(pose, depth, speed, jog):
+def compile_point(pose, depth, speed, jog, repeat_count=DEFAULT_REPEAT_COUNT):
+    if isinstance(repeat_count, bool) or not isinstance(repeat_count, int) or repeat_count < 1:
+        raise ValueError('Repeat count must be a positive integer')
     for value, label in ((depth, 'Depth'), (speed, 'Ingress speed')):
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
             raise ValueError(f'{label} must be a finite number')
@@ -25,13 +28,10 @@ def compile_point(pose, depth, speed, jog):
     for target in (start, bottom):
         if not all(math.isfinite(v) for v in target):
             raise ValueError('Invalid point target')
-        if math.hypot(target[0] - jog.limit_center[0], target[1] - jog.limit_center[1]) > jog.limit_radius:
-            raise ValueError('Point exceeds existing XY limit')
-        if abs(target[2] - jog.home_ref['z']) > jog.z_range:
-            raise ValueError('Point exceeds existing Z limit')
     return [dict(from3=origin, to3=target, speedMmS=velocity,
                  duration=depth / velocity, zOnly=True, pointTest=True,
-                 kind=kind, layer='point', pathIndex=1)
+                 kind=kind, layer='point', pathIndex=repeat + 1)
+            for repeat in range(repeat_count)
             for origin, target, velocity, kind in
             ((start, bottom, speed, 'point_ingress'),
              (bottom, start, RETURN_MM_S, 'point_return'))]
@@ -53,7 +53,8 @@ def prepare_point_locked(jog, body):
     raw = jog._read_run_pose_locked(check_ready=True)
     pose = [jog._local_of(k, raw[k]) for k in 'xyz']
     segments = compile_point(pose, body.get('depth_mm', DEFAULT_DEPTH_MM),
-                             body.get('ingress_speed', DEFAULT_INGRESS_MM_S), jog)
+                             body.get('ingress_speed', DEFAULT_INGRESS_MM_S), jog,
+                             body.get('repeat_count', DEFAULT_REPEAT_COUNT))
     for segment in segments:
         segment['pointContext'] = jog._run_context_locked()
         segment['pointAxes'] = (dict(ESP300_AXES), dict(ESP300_AXIS_SIGNS))

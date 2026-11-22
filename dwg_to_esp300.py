@@ -16,16 +16,18 @@ from typing import Iterable, Sequence
 import ezdxf
 from ezdxf import bbox, disassemble, path
 from ezdxf.addons import odafc
+from z_limit import read_z_max
 from esp300_connection import AXIS_MAPPING_CONFIRMED, ESP300_AXES, ESP300_AXIS_SIGNS
 
 
 Point = tuple[float, float]
 
 # Reversible switch: set False to include the original converted outlines again.
-# This ignores only the exact 99-path Aspose evaluation mark verified on
-# 2026-10-27. It does not delete or rewrite anything in the source DXF.
+# Recognize only verified complete 99-path Aspose evaluation marks.
+# Source DWG/DXF files are never rewritten by the path filter.
 SKIP_KNOWN_ASPOSE_WATERMARK = True
 _ASPOSE_WATERMARK_SHA256 = "573f835a98bd609da3b84ae1ce49c2287e5c24095cefdb66be4d1479aca29fb7"
+_ASPOSE_FRAMED_WATERMARK_SHA256 = "d8c9e023fbdb98c9d2f260d90c9ccf9c14bde7010ada3e07024a3a99b450350d"
 
 
 DEFAULT_FEED_RATE_MM_S = 0.4 # 쓰기 경로를 따라갈 때의 기판 이동 속도
@@ -287,7 +289,9 @@ def entity_to_points(entity, flatness_drawing_units: float) -> list[Point]:
     return dedupe_points((float(v.x), float(v.y)) for v in vertices)
 
 
-def skip_known_aspose_watermark(paths: list[LaserPath], skipped: dict[str, int]) -> list[LaserPath]:
+def skip_known_aspose_watermark(
+    paths: list[LaserPath], skipped: dict[str, int], *, include_framed: bool = True,
+) -> list[LaserPath]:
     if not SKIP_KNOWN_ASPOSE_WATERMARK:
         return paths
     # Conservative recognition of the measured converter output. A different
@@ -297,14 +301,40 @@ def skip_known_aspose_watermark(paths: list[LaserPath], skipped: dict[str, int])
         if p.layer == "0" and p.entity_type == "POLYLINE"
         and all(-1e-7 <= x <= 0.665219 and 0.851041 <= y <= 1.0000001 for x, y in p.points)
     ]
-    if len(candidates) != 99:
+    def outline_digest(candidates: list[LaserPath], x0: float = 0.0, y0: float = 0.0, width: float = 1.0) -> str:
+        outlines = sorted([
+            [[round((x - x0) / width, 8), round((y - y0) / width, 8)] for x, y in p.points]
+            for p in candidates
+        ])
+        return hashlib.sha256(json.dumps(outlines, separators=(",", ":")).encode("ascii")).hexdigest()
+
+    excluded: set[int] = set()
+    if len(candidates) == 99 and outline_digest(candidates) == _ASPOSE_WATERMARK_SHA256:
+        excluded.update(id(p) for p in candidates)
+
+    # This framed warning scales and translates with the drawing. Normalize
+    # against its rectangle, then require all 99 complete outlines to match.
+    # Location, layer, size, or a rectangle alone never identify a watermark.
+    polylines = [p for p in paths if p.layer == "0" and p.entity_type == "POLYLINE"]
+    bounds = [(p, raw_bbox([p])) for p in polylines] if include_framed else []
+    for frame, ((x0, y0), (x1, y1)) in bounds:
+        width, height = x1 - x0, y1 - y0
+        if len(frame.points) != 5 or frame.start != frame.end or width <= 0:
+            continue
+        if not math.isclose(height / width, 0.22392404892840154, rel_tol=1e-7):
+            continue
+        tolerance = width * 1e-9
+        candidates = [
+            p for p, ((px0, py0), (px1, py1)) in bounds
+            if x0 - tolerance <= px0 and px1 <= x1 + tolerance
+            and y0 - tolerance <= py0 and py1 <= y1 + tolerance
+        ]
+        if len(candidates) == 99 and outline_digest(candidates, x0, y0, width) == _ASPOSE_FRAMED_WATERMARK_SHA256:
+            excluded.update(id(p) for p in candidates)
+
+    if not excluded:
         return paths
-    outlines = sorted([[[round(x, 8), round(y, 8)] for x, y in p.points] for p in candidates])
-    digest = hashlib.sha256(json.dumps(outlines, separators=(",", ":")).encode("ascii")).hexdigest()
-    if digest != _ASPOSE_WATERMARK_SHA256:
-        return paths
-    excluded = {id(p) for p in candidates}
-    skipped["known_aspose_watermark"] = len(excluded)
+    skipped["known_aspose_watermark"] = skipped.get("known_aspose_watermark", 0) + len(excluded)
     return [p for p in paths if id(p) not in excluded]
 
 
@@ -316,6 +346,7 @@ def extract_paths(
     flatness_mm: float,
     unit_scale: float | None,
     min_length_mm: float,
+    skip_watermark: bool = True,
 ) -> tuple[list[LaserPath], ezdxf.document.Drawing, dict[str, int]]:
     doc = ezdxf.readfile(dxf_path)
     scale = infer_unit_scale(doc, unit_scale)
@@ -347,7 +378,8 @@ def extract_paths(
 
         paths.append(LaserPath(points=points, layer=layer, entity_type=entity_type, closed=closed))
 
-    paths = skip_known_aspose_watermark(paths, skipped)
+    if skip_watermark:
+        paths = skip_known_aspose_watermark(paths, skipped)
     return paths, doc, skipped
 
 
@@ -662,6 +694,7 @@ def generate_esp300_script(
     z_speed: float = DEFAULT_Z_SPEED_MM_S,
     wait_mode: str = "position",
 ) -> str:
+    z_max = read_z_max()
     path_payload = format_paths_for_python(paths, path_passes=path_passes)
     metadata_payload = json.dumps(metadata, ensure_ascii=True, separators=(",", ":"))
     passes_payload = "None" if passes is None else str(max(0, int(passes)))
@@ -676,6 +709,7 @@ import time
 import serial
 
 
+Z_MAX_MM = {z_max!r}
 AXIS_X = {ESP300_AXES['x']}
 AXIS_Y = {ESP300_AXES['y']}
 AXIS_Z = {ESP300_AXES['z']}
@@ -710,6 +744,9 @@ LASER_OFF_CMD = None
 
 METADATA = json.loads({metadata_payload!r})
 PATHS = json.loads({path_payload!r})
+DRAWING_DEPTH_MM = float(METADATA.get("drawing_depth_mm", 0.0))
+# A small requested entry must still issue a Z move when the first XY is already aligned.
+Z_COMMAND_TOLERANCE = 1e-9 if DRAWING_DEPTH_MM > 0 else POSITION_TOLERANCE
 
 
 def metadata_pair(name: str, default: tuple[float, float]) -> tuple[float, float]:
@@ -856,13 +893,20 @@ def get_position(axis: int, retries: int = TP_READ_RETRIES, retry_delay: float =
 
 
 def move_abs(axis: int, position: float, settle: float = SEND_SETTLE):
-    position = AXIS_SIGNS[axis] * position
-    write_command(f"{{axis}}PA{{position:.6f}}", settle=settle)
+    raw = AXIS_SIGNS[axis] * position
+    if axis == AXIS_Z and (not math.isfinite(raw) or max(raw, float(f"{{raw:.6f}}")) > Z_MAX_MM):
+        raise ValueError(f"Machine Z target {{raw}} mm exceeds the absolute Z limit {{Z_MAX_MM}} mm.")
+    write_command(f"{{axis}}PA{{raw:.6f}}", settle=settle)
 
 
 def move_rel(axis: int, distance: float, settle: float = SEND_SETTLE):
-    distance = AXIS_SIGNS[axis] * distance
-    write_command(f"{{axis}}PR{{distance:.6f}}", settle=settle)
+    global CURRENT_Z
+    if axis == AXIS_Z:
+        current = (CURRENT_Z or 0.0) if DRY_RUN else get_position(axis)
+        move_abs(axis, current + distance, settle=settle)
+        CURRENT_Z = current + distance
+        return
+    write_command(f"{{axis}}PR{{AXIS_SIGNS[axis] * distance:.6f}}", settle=settle)
 
 
 def set_velocity(axis: int, velocity: float, settle: float = SEND_SETTLE):
@@ -960,11 +1004,13 @@ def focus_target_z() -> float:
     # Applies a cumulative Z retreat (defocus direction) at
     # Z_STEP_BACK_PASSES-pass intervals to offset material recession over
     # repeated passes.
-    return float(FOCUS_Z) + float(Z_DEFOCUS_DIRECTION) * float(CURRENT_PASS_RETREAT)
+    return float(FOCUS_Z) + DRAWING_DEPTH_MM + float(Z_DEFOCUS_DIRECTION) * float(CURRENT_PASS_RETREAT)
 
 
 def defocus_target_z() -> float:
-    return focus_target_z() + (float(Z_DEFOCUS_DIRECTION) * abs(float(Z_DEFOCUS_MM)))
+    cut_target = focus_target_z()
+    clearance_reference = float(FOCUS_Z) if DRAWING_DEPTH_MM > 0 else cut_target
+    return clearance_reference + float(Z_DEFOCUS_DIRECTION) * abs(float(Z_DEFOCUS_MM))
 
 
 def move_z_abs(position: float, speed: float = Z_SPEED):
@@ -972,7 +1018,7 @@ def move_z_abs(position: float, speed: float = Z_SPEED):
     target = float(position)
     current = target if CURRENT_Z is None else float(CURRENT_Z)
     distance_z = abs(target - current)
-    if distance_z <= POSITION_TOLERANCE:
+    if distance_z <= Z_COMMAND_TOLERANCE:
         CURRENT_Z = target
         return target
 
@@ -1061,7 +1107,7 @@ def prepare_cut_start(x: float, y: float, move_speed: float):
         laser_on()
         return
 
-    if Z_IS_DEFOCUSED or CURRENT_Z is None or abs(float(CURRENT_Z) - focus_target_z()) > POSITION_TOLERANCE:
+    if Z_IS_DEFOCUSED or CURRENT_Z is None or abs(float(CURRENT_Z) - focus_target_z()) > Z_COMMAND_TOLERANCE:
         focus_z()
     laser_on()
 

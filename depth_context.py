@@ -17,8 +17,7 @@ class DepthContext:
                'axis_numbers':dict(axes), 'legacy_axis_signs':dict(signs),
                'connection_generation':controller._poll_generation,
                'port':controller.port, 'baudrate':controller.baudrate, 'dry_run':controller.dry_run,
-               'limit_center':list(controller.limit_center),'limit_radius':controller.limit_radius,
-               'z_range':controller.z_range,'z_home_raw':controller.z_home_raw}
+               'z_max_mm':controller.z_max_mm,'z_home_raw':controller.z_home_raw}
         digest=fingerprint(state)
         with self.lock:
             if self.last != digest:

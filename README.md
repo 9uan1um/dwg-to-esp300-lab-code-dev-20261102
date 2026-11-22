@@ -4,7 +4,7 @@ November 2 development copy, including substrate point tests and depth recipes.
 
 ## Public source snapshot
 
-Prepared on 2026-11-04 from the current local working copy. This repository starts with fresh history; runtime binaries, research data, raw experimental records, local backups, generated design-specific examples, and legacy PDF/PPTX documentation are excluded. Older documentation below may refer to those local-only files or to a portable ZIP that is not included in this repository. The source launcher can prepare its runtime as described below. Generic test DXF drawings are included.
+Prepared on 2026-11-04 from the current local working copy. This repository starts with fresh history; runtime binaries, research data, raw experimental records, local backups, generated design-specific examples, and legacy PDF/PPTX documentation are excluded. Older documentation below may refer to those local-only files or to a portable ZIP that is not included in this repository. Use the explicit runtime setup in the new-PC guide. Generic test DXF drawings are included.
 
 Historical base: [bbbbaig/dwg-to-esp300-lab-code](https://github.com/bbbbaig/dwg-to-esp300-lab-code), local base commit `230014b`. Existing source notices are preserved; publication does not add a new license grant.
 
@@ -20,47 +20,18 @@ It follows the style of `ESP300_Controller.ipynb`: serial commands such as
 
 ## Run on another Windows PC
 
-**[한국어 빠른 시작](docs/quick-start.ko.md)**
+The current build keeps the camera and manual tools; automatic focus is inactive.
 
-Extract `FLW-ESP300-Windows-x64.zip` completely, then double-click
-`dwg-esp300-launch.cmd`. The portable ZIP includes Python and all application
-libraries; Python, Conda, WSL and internet access are not required to run it.
-On a source-only checkout, the same CMD downloads the local runtime on first
-launch (internet required once). Windows 10/11 x64 is the target platform.
-
-Working Windows COM drivers use the controller directly. Select **Find Windows
-ports**, choose the ESP300 port and use **Test hardware link (no motion)** to
-check the real version response. A COM listing alone does not prove the driver
-works. WSL is an optional workaround when the Windows driver cannot be used.
-If WSL cannot be installed, use a compatible Windows driver/serial adapter;
-the app, drawing preview and dry run work without WSL.
-
-`dwg-esp300-launch.cmd -Check` verifies imports without opening hardware.
-`build-portable.cmd` builds the transferable ZIP under `dist/`. Copy/extract
-the complete app folder, including `runtime/`. Source, drawings, documentation
-and build tools live in this Git repository; local runtime and generated
-outputs are ignored. `research/` preserves original CAD/research and lab records
-and is excluded from the application ZIP.
-
-For USB passthrough through Linux while preserving the Windows Prolific driver,
-see [ESP300 WSL connection](docs/esp300-wsl-connection.md). The web app supports
-`rfc2217://127.0.0.1:22170` and a version-only hardware link test.
+Install the repository or extract the Windows x64 source ZIP completely, then
+follow [the new-PC guide](docs/portable-install.md) for the explicit local Python
+setup, hardware-free check, local safety calibration and optional WSL2 bridge.
+The source ZIP does not contain installed runtimes or machine calibration.
+한국어 ESP300 연결 절차는 [WSL 연결 설명서](docs/esp300-wsl-connection.ko.md)를 참고하세요.
 
 The verified 99-outline Aspose evaluation mark is excluded from motion-path
-extraction by `SKIP_KNOWN_ASPOSE_WATERMARK = True` in `dwg_to_esp300.py`.
-Set it to `False`, restart the server and reopen the drawing to include those
-outlines again. Source DWG/DXF files are not modified. Recognition is limited
-to the exact verified outline geometry; unrelated small design features are
-preserved. Already-loaded drawings keep their existing path list until reopened.
-
-한국어 연결·재연결 절차는 [ESP300 연결 설명서](docs/esp300-wsl-connection.ko.md)를 참고하세요.
-
-For the optional WSL route only, run `esp300-bridge.cmd`, then run
-`dwg-esp300-launch.cmd` in a second CMD window. These launchers call the
-PowerShell scripts internally; no interactive PowerShell commands are needed.
-Each server runs in its CMD window and stays there until Ctrl+C. Use
-`esp300-stop.cmd` in another CMD to stop all ESP300 application servers. Existing
-servers are not silently reused. Closing the browser does not stop the server.
+extraction by the existing SKIP_KNOWN_ASPOSE_WATERMARK setting. Recognition is
+limited to the exact verified outline geometry; unrelated small design features
+are preserved. Source DWG/DXF files are not modified.
 
 ## Generate code from the sample DWG
 
@@ -198,7 +169,7 @@ the displayed picture width divided by 15, with rows starting at the picture's
 top edge and a partial row at the bottom when needed. It follows resizing and
 the enlarged jog view, excludes letterbox bars, and lets target-selection clicks
 through. The grid is a visual movement reference with no distance calibration;
-it does not alter camera frames or autofocus processing.
+it does not alter camera frames.
 
 - DWG input is converted to DXF automatically with ODA File Converter when it is
   installed. If ODA is not found, the script tries `aspose-cad`.
